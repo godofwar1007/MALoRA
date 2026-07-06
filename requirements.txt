@@ -1,0 +1,29 @@
+# Core ML
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Hugging Face
+transformers==4.47.0
+datasets>=2.14.0
+accelerate>=0.26.0
+peft>=0.8.0
+bitsandbytes>=0.42.0
+
+# Flash Attention — install separately:
+# pip install flash-attn --no-build-isolation
+# flash-attn>=2.4.0
+
+# Training
+tqdm>=4.66.0
+numpy>=1.24.0
+
+# Logging
+wandb>=0.16.0
+python-dotenv
+
+# Misc
+scipy>=1.11.0
+sentencepiece>=0.1.99
+protobuf>=3.20.0
+einops>=0.7.0
+packaging>=23.0
