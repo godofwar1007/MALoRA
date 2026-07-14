@@ -1,30 +1,3 @@
-"""
-MALoRA training script.
-
-Forked from the working MoE-LoRA gemini.py. Changes specific to this port:
-
-1. Config field names updated to match MALoRA's LoraMoeConfig:
-       moe_config.experts_rank   -> REMOVED (no longer exists on LoraMoeConfig)
-       moe_config.shared_rank    -> NEW (d, the S_A rank)
-       moe_config.expert_rank    -> NEW (r_bar, the P_t/B_bar_t rank)
-       moe_config.experts_dropout -> NEW (single source of truth for
-                                     MALoRALinear + DispatchMoERouter's
-                                     dropout rate — see peft_experts.py)
-2. use_attention_lora bug fixed: the file this was forked from had this
-   hardcoded to False with a comment claiming "enable attention LoRA" —
-   i.e. the comment and the value contradicted each other. Set explicitly
-   per ATTENTION_LORA_ENABLED below with a comment that actually matches
-   the value, instead of leaving that landmine in place.
-3. WandB config logging updated to report shared_rank/expert_rank instead
-   of the old single experts_rank.
-
-Everything else — MoETrainer (aux loss / routing entropy / expert usage
-tracking, label-clamping safety check, perplexity logging), the emergency
-SIGTERM/SIGINT save handler, checkpoint resume resolution, TrainingArguments,
-and the overall train/save flow — is carried over UNCHANGED. None of it
-references expert internals (MoE-LoRA vs MALoRA), so none of it needed to
-change for this port.
-"""
 
 import os
 import signal
@@ -56,7 +29,7 @@ from modelling import LoraMoeModel
 from training_config import TrainingConfig
 from main import make_dataset
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# Config
 conf = TrainingConfig()
 
 MODEL_ID          = conf.MODEL_ID
@@ -87,20 +60,10 @@ QUANTIZE          = conf.QUANTIZE
 USE_8BIT_ADAM     = conf.USE_8BIT_ADAM
 RESUME_FROM       = conf.RESUME_FROM
 
-# whether to enable attention LoRA (Q/K/V/O) alongside the MALoRA MLP
-# experts. Independent of the MALoRA decomposition — toggle freely.
-# NOTE: the file this was forked from set this to False while its inline
-# comment claimed "enable attention LoRA" — i.e. value and comment
-# contradicted each other, which is exactly the kind of drift the original
-# handoff doc flagged ("use_attention_lora in gemini.py — currently
-# hardcoded True for aton runs. Must manually change to False for atoff
-# runs."). Made an explicit, named constant here instead of an inline
-# magic bool, specifically so this can't silently drift out of sync with
-# its own comment again — change ONLY this line to toggle aton/atoff runs.
 ATTENTION_LORA_ENABLED = True
 
 
-# ── QLoRA config ──────────────────────────────────────────────────────────────
+# QLoRA config
 def get_qlora_bnb_config() -> BitsAndBytesConfig:
     return BitsAndBytesConfig(
         load_in_4bit=True,
@@ -110,7 +73,7 @@ def get_qlora_bnb_config() -> BitsAndBytesConfig:
     )
 
 
-# ── Auto-save on crash/interrupt ──────────────────────────────────────────────
+#  Auto-save on crash/interrupt
 _trainer_ref = None
 
 def _emergency_save(signum, frame):
@@ -130,7 +93,7 @@ signal.signal(signal.SIGTERM, _emergency_save)
 signal.signal(signal.SIGINT,  _emergency_save)
 
 
-# ── Custom MoE Trainer ────────────────────────────────────────────────────────
+# Custom MoE Trainer
 class MoETrainer(Trainer):
     """
     Unchanged from the MoE-LoRA codebase. Tracks aux loss, routing entropy,
@@ -148,10 +111,10 @@ class MoETrainer(Trainer):
         self._current_train_aux_loss: float = 0.0
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        # ── SAFETY: Clamp labels to model's actual vocab size ──────────────────
+        # Clamp labels to model's actual vocab size 
         labels = inputs.get("labels")
         if labels is not None:
-            vocab_size = model.base_model.lm_head.weight.shape[0]   # e.g., 151936 for this model
+            vocab_size = model.base_model.lm_head.weight.shape[0]   
             # Keep -100 as ignore; clamp any other out-of-range value to -100
             invalid_mask = (labels >= vocab_size) | (labels < 0)
             labels = torch.where(
@@ -160,7 +123,6 @@ class MoETrainer(Trainer):
                 labels
             )
             inputs["labels"] = labels
-        # ─────────────────────────────────────────────────────────────────────────
 
         inputs["output_router_logits"] = True
 
@@ -168,7 +130,7 @@ class MoETrainer(Trainer):
 
         loss = outputs.loss
 
-        # ── aux loss tracking ─────────────────────────────────────────────────
+        # aux loss tracking 
         if hasattr(outputs, "aux_loss") and outputs.aux_loss is not None:
             aux_val = outputs.aux_loss.detach().item()
             if model.training:
@@ -176,7 +138,7 @@ class MoETrainer(Trainer):
             else:
                 self._eval_aux_losses.append(aux_val)
 
-        # ── expert routing telemetry ──────────────────────────────────────────
+        # expert routing telemetry 
         if hasattr(outputs, "router_logits") and outputs.router_logits is not None and model.training:
             all_entropies  = []
             all_usage      = []
@@ -239,11 +201,10 @@ class MoETrainer(Trainer):
         return metrics
 
     def _remove_unused_columns(self, dataset, description=None):
-        # keep all columns — our custom collator handles filtering
         return dataset
 
 
-# ── WandB Callback ────────────────────────────────────────────────────────────
+# WandB Callback 
 class WandbConfigCallback(TrainerCallback):
     def on_train_begin(self, args, state, control, **kwargs):
         try:
@@ -266,7 +227,7 @@ class WandbConfigCallback(TrainerCallback):
             pass
 
 
-# ── Checkpoint resume helper ──────────────────────────────────────────────────
+# Checkpoint resume helper
 def resolve_checkpoint(resume_from: str | None, accelerator: Accelerator) -> str | None:
     if not resume_from:
         return None
@@ -290,7 +251,7 @@ def resolve_checkpoint(resume_from: str | None, accelerator: Accelerator) -> str
     return resume_from
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# Main 
 def main():
     global _trainer_ref
 
@@ -308,22 +269,17 @@ def main():
 
     set_seed(SEED)
 
-    # ── Tokenizer ─────────────────────────────────────────────────────────────
+    # Tokenizer 
     if accelerator.is_main_process:
         print("Loading tokenizer...")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-    # Use eos_token_id as pad_token_id (standard practice for causal LMs
-    # without a dedicated pad token). eos_token_id (151645) is a valid token
-    # within len(tokenizer) (151665) -- it only exceeds the narrower
-    # tokenizer.vocab_size (151643), which excludes special tokens but is
-    # NOT the correct bound to validate against.
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side    = "right"   # required for flash attention
     tokenizer.truncation_side = "left"
 
-    # ── Datasets ──────────────────────────────────────────────────────────────
+    # Datasets 
     with accelerator.main_process_first():
         if os.path.exists("data/train") and os.path.exists("data/eval"):
             if accelerator.is_main_process:
@@ -349,7 +305,7 @@ def main():
         label_pad_token_id=-100,   # pad labels with -100, not eos_token_id
     )
 
-    # ── Base model ────────────────────────────────────────────────────────────
+    # Base model 
     if accelerator.is_main_process:
         print("Loading base model...")
         print(f"  QUANTIZE = {QUANTIZE}  ({'4-bit QLoRA' if QUANTIZE else 'full bf16 (no quantization)'})")
@@ -362,21 +318,18 @@ def main():
         device_map={"": accelerator.local_process_index} if QUANTIZE else None,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
-        attn_implementation="sdpa",   # flash_attn_2 crashed in earlier MoE-LoRA runs — stick with sdpa
+        attn_implementation="sdpa",  
     )
 
-    # when not quantizing, bnb's device_map isn't used, so the model loads
-    # on CPU by default — explicitly move it to GPU ourselves.
+    
     if not QUANTIZE:
         base_model = base_model.to(accelerator.device)
 
-    # needed for LoRA/MALoRA gradient flow through a frozen base model
-    # regardless of quantization — gradient checkpointing needs this hook.
     base_model.enable_input_require_grads()
 
     base_model.config.use_cache = False
 
-    # ── MALoRA wrap ───────────────────────────────────────────────────────────
+    # MALoRA wrap
     if accelerator.is_main_process:
         print("Wrapping with MALoRA...")
 
@@ -421,7 +374,7 @@ def main():
             total_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
             print(f"VRAM after model wrap: {allocated:.2f}GB allocated / {reserved:.2f}GB reserved / {total_mem:.2f}GB total")
 
-    # ── Training args ─────────────────────────────────────────────────────────
+    # Training args 
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
         num_train_epochs=NUM_EPOCHS,
@@ -449,14 +402,14 @@ def main():
         seed=SEED,
         save_total_limit=NUM_CHECKPOINT_LIMIT,
         save_strategy="steps",
-        save_steps=EVAL_STEPS,            # saves every eval → always have a recent checkpoint
+        save_steps=EVAL_STEPS,            # saves every eval -> always have a recent checkpoint
         report_to="wandb",
         remove_unused_columns=False,
         load_best_model_at_end=False,
         greater_is_better=False,
     )
 
-    # ── Trainer ───────────────────────────────────────────────────────────────
+    # Trainer 
     trainer = MoETrainer(
         tokenizer=tokenizer,
         model=moe_model,
@@ -471,7 +424,7 @@ def main():
     # register trainer for emergency save on crash
     _trainer_ref = trainer
 
-    # ── Train ─────────────────────────────────────────────────────────────────
+    # Train 
     if accelerator.is_main_process:
         print("\nStarting training...")
         print(f"  Steps per epoch: {len(train_dataset) // (TRAIN_BATCH * GRAD_ACCUM)}")
@@ -479,7 +432,7 @@ def main():
 
     trainer.train(resume_from_checkpoint=resume_from)
 
-    # ── Save ──────────────────────────────────────────────────────────────────
+    # Save 
     if accelerator.is_main_process:
         trainer.save_model(OUTPUT_DIR)
         tokenizer.save_pretrained(OUTPUT_DIR)
