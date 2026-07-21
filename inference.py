@@ -13,6 +13,7 @@ from modelling import LoraMoeModel
 from transformers import TextIteratorStreamer
 import threading 
 import queue   # fix: needed to catch the streamer timeout below
+import torch._dynamo
 
 load_dotenv()   # fix: this was imported but never called, so HF_TOKEN from .env was never actually loaded into os.environ
 
@@ -119,11 +120,6 @@ def warmup(moe_model,tokenizer):
             )
         print(f"  Warmup pass {i+1}/3 done")
 
-    # fix: the passes above only ever exercise a ~8-token prefill. real
-    # requests will look more like 200-500 tokens, so without this the first
-    # real request pays a fresh prefill-shape recompile. running one more
-    # pass with a longer, representative-ish prompt gets that paid for here
-    # instead, during warmup, before anything is actually being served.
     long_dummy_input=tokenizer(
         "def process_data(items):\n    results = []\n    for item in items:\n"
         "        if item is None:\n            continue\n        results.append(item * 2)\n"
@@ -156,6 +152,15 @@ def generate_stream(
     top_k: int          = DEFAULT_TOP_K,
     repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
     system_prompt: str  = SYSTEM_PROMPT,   # fix: caller (server.py/harness) can now override this
+    skip_formatting: bool = False,  # fix(server.py): when True, `prompt` is already a fully
+                                    # rendered chat-template string (built by server.py via
+                                    # apply_chat_template, with the full multi-turn conversation +
+                                    # tools) -- skip build_prompt entirely instead of re-wrapping
+                                    # it as a single user turn under our own SYSTEM_PROMPT.
+    result_info: dict = None,      # fix(server.py): server.py needs prompt/completion token
+                                    # counts and finish_reason (stop vs length). model.generate()
+                                    # still returns the full sequence even with a streamer
+                                    # attached -- pass a dict in and it gets filled before return.
 ):
     """
     Streaming generation - yields tokens as they are produced.
@@ -163,27 +168,17 @@ def generate_stream(
     """
 
     device=next(model.parameters()).device
-    formatted=build_prompt(prompt,tokenizer,system_prompt)
+    formatted = prompt if skip_formatting else build_prompt(prompt,tokenizer,system_prompt)
     inputs=tokenizer(formatted,return_tensors="pt").to(device)
+    input_len = inputs["input_ids"].shape[1]
 
     streamer=TextIteratorStreamer(
         tokenizer,
         skip_prompt=True,    # so it doenst yeild the input prompt back
         skip_special_tokens=True,
-        # fix: without a timeout this queue.get() blocks forever. HF's own
-        # docstring for this param says it's "useful to handle exceptions in
-        # .generate(), when it is called in a separate thread" -- exactly our
-        # case. if generate() crashes before its internal streamer.end() call,
-        # the stop-signal never reaches the queue and the loop below would
-        # hang indefinitely without this.
         timeout=DEFAULT_STREAM_TIMEOUT,
     )
 
-    # fix: top_p/top_k only apply in sampling mode -- passing them unconditionally
-    # when do_sample=False triggers HF UserWarnings every call. repetition_penalty
-    # stays unconditional since it's a logits processor active in both greedy and
-    # sampling decoding (matters MORE in greedy, where it's the only thing stopping
-    # loops) -- unlike top_p/top_k it should never be dropped based on temperature.
     generation_kwargs = dict(
         **inputs,
         max_new_tokens=max_new_tokens,
@@ -197,29 +192,19 @@ def generate_stream(
     if temperature > 0:
         generation_kwargs.update(temperature=temperature, top_p=top_p, top_k=top_k)
 
-    # fix: @torch.no_grad() on this function only covers the thread that calls
-    # generate_stream() -- grad mode is thread-local in torch, so it did NOT
-    # cover model.generate() actually running in the separate thread below.
-    # applying it directly around the thread's target instead. also catches
-    # any exception from the thread so a crash can't hang the streamer loop
-    # forever waiting on a stop-signal that never arrives.
     exception_box = {}
+    seq_box = {}
     def _run_generate():
         try:
-            with torch.inference_mode():   # fix: same swap as generate()/generate_batch() above
-                model.generate(**generation_kwargs)
+            with torch.inference_mode():
+                out = model.generate(**generation_kwargs)
+                seq_box["sequences"] = out   # fix(server.py): generate() still returns this even with a streamer attached
         except Exception as e:
             exception_box["error"] = e
 
-    # generation must run in a separate thread cz the streamer.next() blocks
     thread=threading.Thread(target=_run_generate,daemon=True)
     thread.start()
 
-    # fix: if the thread crashed and never called streamer.end(), the queue
-    # never gets its stop-signal, so streamer.__next__() would block on
-    # queue.get() forever -- the timeout above turns that into queue.Empty
-    # instead, and we surface whatever the thread actually raised (if we
-    # caught one) rather than a generic queue.Empty.
     try:
         for token in streamer:
             yield token 
@@ -233,8 +218,16 @@ def generate_stream(
     if "error" in exception_box:
         raise exception_box["error"]
 
+    # fix(server.py): fill in result_info for the caller now that generation is done
+    if result_info is not None and "sequences" in seq_box:
+        gen_ids = seq_box["sequences"][0][input_len:]
+        last_tok = gen_ids[-1].item() if len(gen_ids) > 0 else None
+        result_info["prompt_tokens"] = input_len
+        result_info["completion_tokens"] = len(gen_ids)
+        result_info["finish_reason"] = "stop" if last_tok == tokenizer.eos_token_id else "length"
+
 # loading the model 
-def load_model(hf_folder :str):
+def load_model(hf_folder: str, attn_on: bool = True):
     """
     this just downloads the checkpoint form the hf repo and loads it i tried
     to keep it to be similar to the eval pattern 
@@ -244,7 +237,6 @@ def load_model(hf_folder :str):
     print(f"Loading: {HF_REPO_ID}/{hf_folder}")
     print(f"{'='*60}\n")
     
-    # downloading from hf 
     print("Downloading checkpoint from HF Hub...")
     local_dir=snapshot_download(
         repo_id=HF_REPO_ID,
@@ -253,7 +245,6 @@ def load_model(hf_folder :str):
         local_dir=f"./hf_cache/{hf_folder.replace('/', '_')}",
     )
 
-    # finding and handling the safetensors file 
     ckpt_path = os.path.join(local_dir, hf_folder, "model.safetensors")
     if not os.path.exists(ckpt_path):
         ckpt_path = os.path.join(local_dir, "model.safetensors")
@@ -269,43 +260,37 @@ def load_model(hf_folder :str):
     print(f"Checkpoint: {ckpt_path}")
     print(f"Size: {os.path.getsize(ckpt_path)/1e9:.2f} GB\n")
 
-
-    # loading the tokenizer 
     print("Loading tokenizer .....")
     tokenizer=AutoTokenizer.from_pretrained(BASE_MODEL,trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id=tokenizer.eos_token_id
-    tokenizer.padding_side="left" # left padding for the bacth generation 
+    tokenizer.padding_side="left" 
 
-    # lodaing the base model
     print("Loading base model...")
     base_model=AutoModelForCausalLM.from_pretrained(
         BASE_MODEL,
         torch_dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True,
-        attn_implementation="sdpa", # flash attention wasnt working due to some cuda errors so as of now i have kept this one 
+        attn_implementation="sdpa",
     )
 
-    # wrapping with malora
-    print("Wrapping with MALoRA (attention LoRA ON)...")
+    print(f"Wrapping with MALoRA (attention LoRA {'ON' if attn_on else 'OFF'})...")
     moe_config = LoraMoeConfig.from_pretrained(BASE_MODEL)
-    # MALoRA-specific fields 
-    moe_config.shared_rank          = 16      # d — shared S_A subspace rank
-    moe_config.expert_rank          = 16      # r_bar — per-expert P_t/B_bar_t rank
-    moe_config.experts_dropout      = 0.05    # single source of truth for dropout rate
+    moe_config.shared_rank          = 16
+    moe_config.expert_rank          = 16
+    moe_config.experts_dropout      = 0.05
     moe_config.attention_rank       = 32
     moe_config.experts_scale        = 1.0
     moe_config.num_experts_per_tok  = 2
     moe_config.num_local_experts    = 8
-    moe_config.output_router_logits = False   # off for inference — no aux loss needed
+    moe_config.output_router_logits = False
     moe_config.router_aux_loss_coef = 0.001
-    moe_config.use_attention_lora   = True    # HARDCODED ON — this script is for aton checkpoints
-                                               # if you need atoff, set this to False
+    moe_config.use_attention_lora   = attn_on   # fix(server.py): was hardcoded True -- now the
+                                                 # caller decides (server.py reads MALORA_ATTN_ON)
 
     moe_model=LoraMoeModel(base_model,moe_config)
 
-    # loading the saved weights 
     print("Loading saved LoRA weights...")
     saved_sd = load_file(ckpt_path, device="cpu")
     model_sd = moe_model.state_dict()
@@ -313,14 +298,10 @@ def load_model(hf_folder :str):
     print(f"  Checkpoint keys: {len(saved_sd)}")
     print(f"  Model keys:      {len(model_sd)}")
     
-    # trying to match the keys / weights so that we can know if we have done it correctlty  
-    # the malora with aton is 2600 something and the moelora with aton is 2500 something and with atoff is 2200-2300 something i guess
-    # try direct match first
     matched   = {k: v for k, v in saved_sd.items() if k in model_sd}
     unmatched = [k for k in saved_sd if k not in model_sd]
 
     if len(matched) == 0:
-        # try prefix remapping (base_model. prefix may or may not be present)
         print("  Direct keys didn't match — trying prefix remapping...")
         remapped = {}
         for k, v in saved_sd.items():
@@ -345,7 +326,6 @@ def load_model(hf_folder :str):
     load_result = moe_model.load_state_dict(matched,strict=False)
     print(f"  Missing from checkpoint (frozen base weights expected): {len(load_result.missing_keys)}")
 
-    # just a verification to ensure that the lora weights actually loaded 
     lora_keys = [k for k in matched if "lora" in k.lower() or "router" in k.lower() or "gate_SA" in k]
     print(f"  LoRA/router keys loaded: {len(lora_keys)}")
     if len(lora_keys) == 0:
@@ -353,8 +333,6 @@ def load_model(hf_folder :str):
         print(f"  Checkpoint samples: {list(saved_sd.keys())[:5]}")
         print(f"  Model samples:      {list(model_sd.keys())[:5]}")
 
-    # seting the eval mode here 
-    # the eval mode here is not the benchmarking one lol ...these is related to dropout and batch norm just think it is opposit to eval 
     moe_model.eval()
     moe_model.base_model.config.use_cache=True
 
@@ -373,9 +351,6 @@ def load_model(hf_folder :str):
 def build_prompt(user_message: str, tokenizer, system_prompt: str = SYSTEM_PROMPT) -> str:
     """
     Apply Qwen2.5's chat template correctly.
-    Uses the system prompt defined above by default, but the harness can
-    override it per-request (fix: this used to be hardcoded with no way for
-    a caller to supply its own system prompt).
     """
     messages = [
         {"role": "system",    "content": system_prompt},
@@ -384,11 +359,10 @@ def build_prompt(user_message: str, tokenizer, system_prompt: str = SYSTEM_PROMP
     return tokenizer.apply_chat_template(
         messages,
         tokenize=False,
-        add_generation_prompt=True,   # adds <|im_start|>assistant\n at the end
+        add_generation_prompt=True,
     )
 
-@torch.inference_mode()   # fix: stricter than no_grad -- also skips version-counter
-                           # tracking on tensors, lower memory + faster for pure inference
+@torch.inference_mode()
 def generate(
     model,
     tokenizer,
@@ -398,7 +372,9 @@ def generate(
     top_p: float        = DEFAULT_TOP_P,
     top_k: int          = DEFAULT_TOP_K,
     repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
-    system_prompt: str  = SYSTEM_PROMPT,   # fix: caller (server.py/harness) can now override this
+    system_prompt: str  = SYSTEM_PROMPT,
+    skip_formatting: bool = False,  # fix(server.py): same as generate_stream() above
+    result_info: dict = None,      # fix(server.py): same as generate_stream() above
 ) -> str:
     """
     Run generation on a single prompt string.
@@ -406,12 +382,11 @@ def generate(
     """
     device = next(model.parameters()).device
  
-    formatted = build_prompt(prompt, tokenizer, system_prompt)
+    formatted = prompt if skip_formatting else build_prompt(prompt, tokenizer, system_prompt)
     inputs    = tokenizer(formatted, return_tensors="pt").to(device)
  
     input_len = inputs["input_ids"].shape[1]
  
-    # fix: see generate_stream above -- same reasoning for the sampling-params guard
     gen_kwargs = dict(
         max_new_tokens=max_new_tokens,
         do_sample=temperature > 0,
@@ -424,13 +399,18 @@ def generate(
         gen_kwargs.update(temperature=temperature, top_p=top_p, top_k=top_k)
 
     outputs = model.generate(**inputs, **gen_kwargs)
+
+    if result_info is not None:
+        gen_ids_for_info = outputs[0][input_len:]
+        last_tok = gen_ids_for_info[-1].item() if len(gen_ids_for_info) > 0 else None
+        result_info["prompt_tokens"] = input_len
+        result_info["completion_tokens"] = len(gen_ids_for_info)
+        result_info["finish_reason"] = "stop" if last_tok == tokenizer.eos_token_id else "length"
  
-    # decode only the newly generated tokens, not the input
     generated_ids = outputs[0][input_len:]
     return tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
-# similar is the generate stream i wrote it at the top cz it is more imp
-@torch.inference_mode()   # fix: see generate() above -- same reasoning
+@torch.inference_mode()
 def generate_batch(
     model,
     tokenizer,
@@ -440,8 +420,7 @@ def generate_batch(
     top_p: float        = DEFAULT_TOP_P,
     top_k: int          = DEFAULT_TOP_K,
     repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
-    system_prompt: str  = SYSTEM_PROMPT,   # fix: this got added to generate()/generate_stream()
-                                           # earlier but was missed here
+    system_prompt: str  = SYSTEM_PROMPT,
 ) -> list[str]:
     """
     Batch generation — more efficient when you have multiple prompts.
@@ -453,14 +432,13 @@ def generate_batch(
     inputs    = tokenizer(
         formatted,
         return_tensors="pt",
-        padding=True,          # left-pad (tokenizer.padding_side = "left")
+        padding=True,
         truncation=True,
         max_length=2048,
     ).to(device)
  
     input_len = inputs["input_ids"].shape[1]
  
-    # fix: same sampling-params guard as generate()/generate_stream() above
     gen_kwargs = dict(
         max_new_tokens=max_new_tokens,
         do_sample=temperature > 0,
@@ -476,14 +454,11 @@ def generate_batch(
  
     results = []
     for i, out in enumerate(outputs):
-        # for each sample, strip the input (accounting for padding)
-        # input_ids[i] has left-padding, so find where actual input ends
         gen_tokens = out[input_len:]
         results.append(tokenizer.decode(gen_tokens, skip_special_tokens=True).strip())
  
     return results
 
-# a simple sanity check 
 def run_sanity_check(model, tokenizer):
     """
     Three quick test prompts to verify the model is generating correctly
@@ -510,7 +485,6 @@ def run_sanity_check(model, tokenizer):
     print("="*60 + "\n")
 
 
-# a simple interactive mode just for the testing 
 def interactive_loop(model, tokenizer, args):
     """
     REPL-style interactive generation.
@@ -544,8 +518,6 @@ def interactive_loop(model, tokenizer, args):
         )
         print(f"\n{result}\n")
 
-# the main function 
-
 def main():
 
     parser=argparse.ArgumentParser(description="Malora inference script")          
@@ -574,17 +546,14 @@ def main():
 
     args=parser.parse_args()
 
-    # load model
     model, tokenizer = load_model(args.folder)  
     
-    # santity check
     run_sanity_check(model,tokenizer)
 
     if args.sanity_only:
         print("--sanity-only flag set. Exiting.")
         return 
 
-    # single prompt mode
     if args.prompt_file:
         if not os.path.exists(args.prompt_file):
             print(f"ERROR: prompt file not found: {args.prompt_file}")
@@ -620,7 +589,6 @@ def main():
         print(result)
         return
     
-    # default : interactive loop 
     interactive_loop(model,tokenizer,args)
 
 if __name__ == "__main__":

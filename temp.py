@@ -1,17 +1,46 @@
-import os 
-import json 
-import time 
+"""
+server.py -- OpenAI-compatible /v1/chat/completions server for the MALoRA model.
+
+Built directly against what openharness's openai_client.py actually sends
+(confirmed by reading that file, not guessed):
+  - endpoint: POST /v1/chat/completions (base_url + /v1 + /chat/completions)
+  - always streaming ("stream": True, hardcoded on their side)
+  - stream_options.include_usage present UNLESS tools are in the request
+  - messages: already OpenAI-shaped (system/user/assistant/tool roles)
+  - tools: OpenAI function-calling format
+  - max_tokens (our model name won't match gpt-5*/o1*/o3*/o4*, so it's always
+    max_tokens, never max_completion_tokens, on their side -- we accept both
+    anyway for robustness / manual curl testing)
+
+Tool-call format: confirmed by actually rendering Qwen2.5-Coder-3B-Instruct's
+own chat template with tools= -- it's Hermes-style <tool_call>{...}</tool_call>
+tags, same template on both the Coder and plain Instruct variants.
+
+Run:
+    MALORA_HF_FOLDER=malora_50k_1ep_aton uvicorn server:app --host 0.0.0.0 --port 8000
+
+Test:
+    curl -X POST http://localhost:8000/v1/chat/completions \
+      -H "Content-Type: application/json" \
+      -d '{"messages": [{"role":"user","content":"def hello():"}], "stream": false}'
+"""
+
+import os
+import json
+import time
 import uuid
 import asyncio
-import uvicorn 
-import logging 
-import threading 
+import logging
+import threading
 from contextlib import asynccontextmanager
-from fastapi import FastAPI,Request
-from fastapi.responses import JSONResponse,StreamingResponse
 
-from inference import load_model,generate,generate_stream
-from inference import(
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from inference import (
+    load_model,
+    generate,
+    generate_stream,
     DEFAULT_MAX_NEW_TOKENS,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
@@ -19,10 +48,12 @@ from inference import(
     DEFAULT_REPETITION_PENALTY,
 )
 
-log=logging.getLogger("malora.server")
-logging.basicConfig(level=logging.INFO,format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("malora.server")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# some configs and args form terminal related to the model/checkpoint details
+# ── config, from env vars so the checkpoint can change per-deployment without
+# touching this file. no default on the folder -- fail loudly at startup
+# rather than silently loading the wrong checkpoint.
 HF_FOLDER = os.environ.get("MALORA_HF_FOLDER")
 if not HF_FOLDER:
     raise RuntimeError(
@@ -32,25 +63,32 @@ if not HF_FOLDER:
 ATTN_ON = os.environ.get("MALORA_ATTN_ON", "1") == "1"
 MODEL_NAME_FOR_RESPONSES = os.environ.get("MALORA_MODEL_NAME", "malora")
 
-_model=None
-_tokenizer=None
+# ── one model instance for the whole process, loaded once at startup ───────
+_model = None
+_tokenizer = None
 
-# a lock here so that no two concurrent locks call model.generate()  at the same time 
-_generation_lock=threading.Lock()
+# real generation must be single-flight: one model, one GPU, one shared set of
+# compiled graphs / KV cache. this lock serializes every request (streaming or
+# not) so two concurrent calls never touch model.generate() at the same time.
+# it's a plain threading.Lock, not asyncio.Lock, because the actual generation
+# runs on background threads (Starlette's threadpool for the sync generator
+# below, plus generate_stream's own internal thread) -- not on the event loop.
+_generation_lock = threading.Lock()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _model,_tokenizer
+    global _model, _tokenizer
     log.info("Loading model: folder=%s attn_on=%s", HF_FOLDER, ATTN_ON)
-    _model,_tokenizer=load_model(HF_FOLDER, attn_on=ATTN_ON)
+    _model, _tokenizer = load_model(HF_FOLDER, attn_on=ATTN_ON)
     log.info("Model ready, accepting requests.")
     yield
-    log.info("shutting down")
+    log.info("Shutting down.")
 
 
-app=FastAPI(lifespan=lifespan)
+app = FastAPI(lifespan=lifespan)
 
-# just an endpoint to check if everything is okay or not 
+
 @app.get("/health")
 async def health():
     # reachable at all only once lifespan startup (i.e. load_model) has
@@ -58,13 +96,15 @@ async def health():
     # 200 here already means "warm". this is what modal_deploy.py will poll.
     return {"status": "ok"}
 
-# some tool call parsing 
+
+# ── tool-call tag parsing ────────────────────────────────────────────────────
 # confirmed tag format by actually rendering the tokenizer's chat template
 # with tools= a few turns back: <tool_call>\n{"name": ..., "arguments": ...}\n</tool_call>
 TOOL_CALL_OPEN  = "<tool_call>"
 TOOL_CALL_CLOSE = "</tool_call>"
 
-def parse_tool_calls(token_iter):
+
+def _parse_tool_calls(token_iter):
     """
     Wraps a stream of text pieces (or a single full string, wrapped in an
     iterator), watching for <tool_call>...</tool_call> blocks -- same idea as
@@ -107,15 +147,17 @@ def parse_tool_calls(token_iter):
     if buffer:
         yield ("text", buffer)
 
-def extract_tool_calls(full_text: str):
+
+def _extract_tool_calls(full_text: str):
     """Same parser as above, applied to one already-complete string (non-streaming path)."""
     text_parts, tool_calls = [], []
-    for kind, value in parse_tool_calls(iter([full_text])):
+    for kind, value in _parse_tool_calls(iter([full_text])):
         (text_parts if kind == "text" else tool_calls).append(value)
     return "".join(text_parts), tool_calls
 
-# messages/tools prep for the chat template 
-def prepare_messages(messages):
+
+# ── messages/tools prep for the chat template ───────────────────────────────
+def _prepare_messages(messages):
     """
     OpenAI's wire format encodes tool_call arguments as a JSON STRING (both in
     requests and in what we'd echo back for prior turns), but the tokenizer's
@@ -145,19 +187,21 @@ def prepare_messages(messages):
         prepared.append(msg)
     return prepared
 
-def build_prompt_and_tokens(body):
+
+def _build_prompt_and_tokens(body):
     messages = body.get("messages")
     if not messages:
         raise ValueError("request body must include a non-empty 'messages' list")
     tools    = body.get("tools") or None
-    prepared = prepare_messages(messages)
+    prepared = _prepare_messages(messages)
     formatted = _tokenizer.apply_chat_template(
         prepared, tools=tools, tokenize=False, add_generation_prompt=True
     )
     prompt_tokens = len(_tokenizer(formatted, add_special_tokens=False)["input_ids"])
     return formatted, prompt_tokens
 
-def gen_kwargs_from_body(body):
+
+def _gen_kwargs_from_body(body):
     # fix: `a or b or c` treats an explicit 0 the same as "not provided" --
     # use is-not-None checks so max_tokens=0 (unusual, but valid per the
     # OpenAI spec) isn't silently overridden with our default.
@@ -174,8 +218,9 @@ def gen_kwargs_from_body(body):
         repetition_penalty=body.get("repetition_penalty", DEFAULT_REPETITION_PENALTY),
     )
 
-# Openai chunk/response builders 
-def chunk(request_id, created, model_name, delta=None, finish_reason=None, usage=None):
+
+# ── OpenAI chunk/response builders ──────────────────────────────────────────
+def _chunk(request_id, created, model_name, delta=None, finish_reason=None, usage=None):
     payload = {
         "id":      request_id,
         "object":  "chat.completion.chunk",
@@ -191,14 +236,17 @@ def chunk(request_id, created, model_name, delta=None, finish_reason=None, usage
         payload["choices"] = [{"index": 0, "delta": delta or {}, "finish_reason": finish_reason}]
     return payload
 
-def sse(payload) -> str:
+
+def _sse(payload) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
-def new_tool_call_id():
+
+def _new_tool_call_id():
     return f"call_{uuid.uuid4().hex[:24]}"
 
-# streaming path 
-def stream_events(body,request_id,model_name):
+
+# ── streaming path ───────────────────────────────────────────────────────────
+def _stream_events(body, request_id, model_name):
     """
     Plain (sync) generator -- Starlette's StreamingResponse detects it's not
     an async iterator and runs it via its own threadpool automatically, so
@@ -209,23 +257,38 @@ def stream_events(body,request_id,model_name):
     long before this generator actually runs).
     """
     created      = int(time.time())
+    # fix: real OpenAI sends the usage chunk whenever include_usage is set,
+    # tools or not -- "drop it if tools present" was the harness's own
+    # defensive quirk for some other backend, not a protocol requirement.
     include_usage = bool(body.get("stream_options", {}).get("include_usage"))
 
+    # fix: broadened from `except ValueError` -- that only ever fired for the
+    # empty-messages case, which chat_completions() already guards before this
+    # generator is even called (dead code). A bad tools schema or unexpected
+    # message shape raises from apply_chat_template itself (a template error,
+    # not ValueError) -- uncaught, that propagated out of the generator as an
+    # abrupt connection close instead of a clean SSE error chunk.
     try:
-        formatted, prompt_tokens = build_prompt_and_tokens(body)
+        formatted, prompt_tokens = _build_prompt_and_tokens(body)
     except Exception as e:
-        yield sse({"error": {"message": str(e), "type": "invalid_request_error"}})
+        yield _sse({"error": {"message": str(e), "type": "invalid_request_error"}})
         yield "data: [DONE]\n\n"
         return
 
-    gen_kwargs = gen_kwargs_from_body(body)
+    gen_kwargs = _gen_kwargs_from_body(body)
 
     # real OpenAI sends a role-only chunk first, before any content
-    yield sse(chunk(request_id, created, model_name, delta={"role": "assistant"}))
+    yield _sse(_chunk(request_id, created, model_name, delta={"role": "assistant"}))
 
     text_parts     = []
     saw_tool_call  = False
     tool_index     = 0
+    # fix: generate_stream() fills this in with the real prompt/completion
+    # token counts and finish_reason (checked against the actual eos_token_id
+    # from model.generate()'s returned sequence) -- more accurate than
+    # retokenizing the decoded text afterward, which can drift slightly
+    # (skip_special_tokens drops tokens from the count, and re-tokenizing
+    # text isn't guaranteed to reproduce the exact original token boundaries).
     result_info: dict = {}
 
     with _generation_lock:
@@ -234,16 +297,16 @@ def stream_events(body,request_id,model_name):
                 _model, _tokenizer, formatted, skip_formatting=True,
                 result_info=result_info, **gen_kwargs,
             )
-            for kind, value in parse_tool_calls(token_iter):
+            for kind, value in _parse_tool_calls(token_iter):
                 if kind == "text":
                     if value:
                         text_parts.append(value)
-                        yield sse(chunk(request_id, created, model_name, delta={"content": value}))
+                        yield _sse(_chunk(request_id, created, model_name, delta={"content": value}))
                 else:
                     saw_tool_call = True
                     tc = {
                         "index": tool_index,
-                        "id":    new_tool_call_id(),
+                        "id":    _new_tool_call_id(),
                         "type":  "function",
                         "function": {
                             "name":      value.get("name", ""),
@@ -251,10 +314,10 @@ def stream_events(body,request_id,model_name):
                         },
                     }
                     tool_index += 1
-                    yield sse(chunk(request_id, created, model_name, delta={"tool_calls": [tc]}))
+                    yield _sse(_chunk(request_id, created, model_name, delta={"tool_calls": [tc]}))
         except Exception as e:
             log.exception("generation failed mid-stream (request_id=%s)", request_id)
-            yield sse({"error": {"message": str(e), "type": "server_error"}})
+            yield _sse({"error": {"message": str(e), "type": "server_error"}})
             yield "data: [DONE]\n\n"
             return
 
@@ -266,7 +329,7 @@ def stream_events(body,request_id,model_name):
     else:
         finish_reason = result_info.get("finish_reason", "stop")
 
-    yield sse(chunk(request_id, created, model_name, delta={}, finish_reason=finish_reason))
+    yield _sse(_chunk(request_id, created, model_name, delta={}, finish_reason=finish_reason))
 
     if include_usage:
         usage = {
@@ -274,15 +337,16 @@ def stream_events(body,request_id,model_name):
             "completion_tokens": completion_tokens,
             "total_tokens":      prompt_tokens + completion_tokens,
         }
-        yield sse(chunk(request_id, created, model_name, usage=usage))
+        yield _sse(_chunk(request_id, created, model_name, usage=usage))
 
     yield "data: [DONE]\n\n"
 
-# non streaming path 
-def complete(body, request_id, model_name):
+
+# ── non-streaming path ───────────────────────────────────────────────────────
+def _complete(body, request_id, model_name):
     """Runs on a worker thread via asyncio.to_thread -- keeps the event loop free."""
-    formatted, prompt_tokens = build_prompt_and_tokens(body)
-    gen_kwargs = gen_kwargs_from_body(body)
+    formatted, prompt_tokens = _build_prompt_and_tokens(body)
+    gen_kwargs = _gen_kwargs_from_body(body)
 
     result_info: dict = {}   # fix: same reasoning as the streaming path above
     with _generation_lock:
@@ -291,7 +355,7 @@ def complete(body, request_id, model_name):
             result_info=result_info, **gen_kwargs,
         )
 
-    content, tool_calls = extract_tool_calls(raw_text)
+    content, tool_calls = _extract_tool_calls(raw_text)
     completion_tokens = result_info.get("completion_tokens", 0)
     prompt_tokens = result_info.get("prompt_tokens", prompt_tokens)
 
@@ -299,7 +363,7 @@ def complete(body, request_id, model_name):
     if tool_calls:
         message["tool_calls"] = [
             {
-                "id":   new_tool_call_id(),
+                "id":   _new_tool_call_id(),
                 "type": "function",
                 "function": {
                     "name":      tc.get("name", ""),
@@ -325,7 +389,8 @@ def complete(body, request_id, model_name):
         },
     }
 
-# endpoint 
+
+# ── endpoint ─────────────────────────────────────────────────────────────────
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body       = await request.json()
@@ -349,12 +414,12 @@ async def chat_completions(request: Request):
 
     if stream:
         return StreamingResponse(
-            stream_events(body, request_id, model_name),
+            _stream_events(body, request_id, model_name),
             media_type="text/event-stream",
         )
 
     try:
-        result = await asyncio.to_thread(complete, body, request_id, model_name)
+        result = await asyncio.to_thread(_complete, body, request_id, model_name)
         return JSONResponse(result)
     except Exception as e:
         log.exception("request failed (request_id=%s)", request_id)
@@ -365,4 +430,5 @@ async def chat_completions(request: Request):
 
 
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
