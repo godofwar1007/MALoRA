@@ -6,9 +6,11 @@ import asyncio
 import uvicorn 
 import logging 
 import threading 
+import queue
 from contextlib import asynccontextmanager
 from fastapi import FastAPI,Request
 from fastapi.responses import JSONResponse,StreamingResponse
+from starlette.requests import ClientDisconnect
 
 from inference import load_model,generate,generate_stream
 from inference import(
@@ -34,15 +36,16 @@ MODEL_NAME_FOR_RESPONSES = os.environ.get("MALORA_MODEL_NAME", "malora")
 
 _model=None
 _tokenizer=None
+_telemetry=None
 
 # a lock here so that no two concurrent locks call model.generate()  at the same time 
 _generation_lock=threading.Lock()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _model,_tokenizer
+    global _model,_tokenizer,_telemetry
     log.info("Loading model: folder=%s attn_on=%s", HF_FOLDER, ATTN_ON)
-    _model,_tokenizer=load_model(HF_FOLDER, attn_on=ATTN_ON)
+    _model,_tokenizer,_telemetry=load_model(HF_FOLDER, attn_on=ATTN_ON)
     log.info("Model ready, accepting requests.")
     yield
     log.info("shutting down")
@@ -198,7 +201,7 @@ def new_tool_call_id():
     return f"call_{uuid.uuid4().hex[:24]}"
 
 # streaming path 
-def stream_events(body,request_id,model_name):
+def stream_events(body,request_id,model_name,telemetry=None):
     """
     Plain (sync) generator -- Starlette's StreamingResponse detects it's not
     an async iterator and runs it via its own threadpool automatically, so
@@ -232,7 +235,9 @@ def stream_events(body,request_id,model_name):
         try:
             token_iter = generate_stream(
                 _model, _tokenizer, formatted, skip_formatting=True,
-                result_info=result_info, **gen_kwargs,
+                result_info=result_info, 
+                telemetry=telemetry,
+                **gen_kwargs,
             )
             for kind, value in parse_tool_calls(token_iter):
                 if kind == "text":
@@ -279,7 +284,7 @@ def stream_events(body,request_id,model_name):
     yield "data: [DONE]\n\n"
 
 # non streaming path 
-def complete(body, request_id, model_name):
+def complete(body, request_id, model_name,telemetry=None):
     """Runs on a worker thread via asyncio.to_thread -- keeps the event loop free."""
     formatted, prompt_tokens = build_prompt_and_tokens(body)
     gen_kwargs = gen_kwargs_from_body(body)
@@ -288,7 +293,9 @@ def complete(body, request_id, model_name):
     with _generation_lock:
         raw_text = generate(
             _model, _tokenizer, formatted, skip_formatting=True,
-            result_info=result_info, **gen_kwargs,
+            result_info=result_info, 
+            telemetry=telemetry,
+            **gen_kwargs,
         )
 
     content, tool_calls = extract_tool_calls(raw_text)
@@ -349,12 +356,12 @@ async def chat_completions(request: Request):
 
     if stream:
         return StreamingResponse(
-            stream_events(body, request_id, model_name),
+            stream_events(body, request_id, model_name,telemetry=_telemetry),
             media_type="text/event-stream",
         )
 
     try:
-        result = await asyncio.to_thread(complete, body, request_id, model_name)
+        result = await asyncio.to_thread(complete, body, request_id, model_name,telemetry=_telemetry)
         return JSONResponse(result)
     except Exception as e:
         log.exception("request failed (request_id=%s)", request_id)
@@ -362,6 +369,29 @@ async def chat_completions(request: Request):
             status_code=500,
             content={"error": {"message": str(e), "type": "server_error"}},
         )
+
+# telemetry endpoint 
+@app.get("/telemetry/stream")
+async def telemetry_stream():
+    """Server-Sent Events endpoint for live routing telemetry."""
+    def event_generator():
+        while True:
+            try:
+                payload=_telemetry.queue.get(timeout=1.0)
+                yield f"data: {json.dumps(payload)}\n\n"
+            except queue.Empty:
+                yield ":keepalive\n\n"
+            except ClientDisconnect:
+                break
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )            
 
 
 if __name__ == "__main__":
