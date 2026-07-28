@@ -9,16 +9,20 @@ from dotenv import load_dotenv
 
 from configuration_lora_moe import LoraMoeConfig
 from modelling import LoraMoeModel
+from telemetry import RoutingTelemetry
+
 
 from transformers import TextIteratorStreamer
 import threading 
 import queue   # fix: needed to catch the streamer timeout below
-import torch._dynamo
 
 load_dotenv()   # fix: this was imported but never called, so HF_TOKEN from .env was never actually loaded into os.environ
 
 torch.backends.cuda.matmul.allow_tf32 = True   # fix: free throughput on Ampere+ (A10G/L40S/H100), no downside for bf16 weights
 torch.backends.cudnn.allow_tf32 = True
+
+# some things related to telemetry 
+
 
 # config 
 BASE_MODEL  = "Qwen/Qwen2.5-Coder-3B-Instruct"
@@ -161,6 +165,7 @@ def generate_stream(
                                     # counts and finish_reason (stop vs length). model.generate()
                                     # still returns the full sequence even with a streamer
                                     # attached -- pass a dict in and it gets filled before return.
+    telemetry=None,                                
 ):
     """
     Streaming generation - yields tokens as they are produced.
@@ -202,29 +207,48 @@ def generate_stream(
         except Exception as e:
             exception_box["error"] = e
 
-    thread=threading.Thread(target=_run_generate,daemon=True)
-    thread.start()
-
     try:
-        for token in streamer:
-            yield token 
-    except queue.Empty:
-        thread.join(timeout=1)
-        if "error" in exception_box:
-            raise exception_box["error"]
-        raise TimeoutError(f"generate_stream: no token for {DEFAULT_STREAM_TIMEOUT}s, generation likely hung")
 
-    thread.join()    
-    if "error" in exception_box:
-        raise exception_box["error"]
+        if telemetry:
+            telemetry.active=True
+            telemetry.reset_session()
 
-    # fix(server.py): fill in result_info for the caller now that generation is done
-    if result_info is not None and "sequences" in seq_box:
-        gen_ids = seq_box["sequences"][0][input_len:]
-        last_tok = gen_ids[-1].item() if len(gen_ids) > 0 else None
-        result_info["prompt_tokens"] = input_len
-        result_info["completion_tokens"] = len(gen_ids)
-        result_info["finish_reason"] = "stop" if last_tok == tokenizer.eos_token_id else "length"
+        thread=threading.Thread(target=_run_generate,daemon=True)
+        thread.start()
+
+        try:
+            for token in streamer:
+                yield token
+        except queue.Empty:
+            # Generation stalled - raise a clear error 
+            # fix: was a bare thread.join() with no timeout -- we've already
+            # waited the full DEFAULT_STREAM_TIMEOUT for a token at this
+            # point, so if the thread is genuinely stuck (not crashed, just
+            # hung) this would block forever again, defeating the whole
+            # point of the streamer timeout. give it a short grace period
+            # instead.
+            thread.join(timeout=1)
+            if "error" in exception_box:
+                raise exception_box["error"]
+            raise TimeoutError(f"generate_stream: no token for {DEFAULT_STREAM_TIMEOUT}s, generation likely hung")        
+        finally:        
+
+            thread.join()
+            if "error" in exception_box:
+                raise exception_box["error"]
+                        
+    finally:
+        if telemetry:
+            telemetry.active=False       
+
+  
+        # fix(server.py): fill in result_info for the caller now that generation is done
+        if result_info is not None and "sequences" in seq_box:
+            gen_ids = seq_box["sequences"][0][input_len:]
+            last_tok = gen_ids[-1].item() if len(gen_ids) > 0 else None
+            result_info["prompt_tokens"] = input_len
+            result_info["completion_tokens"] = len(gen_ids)
+            result_info["finish_reason"] = "stop" if last_tok == tokenizer.eos_token_id else "length"
 
 # loading the model 
 def load_model(hf_folder: str, attn_on: bool = True):
@@ -345,7 +369,10 @@ def load_model(hf_folder: str, attn_on: bool = True):
     
     apply_compile(moe_model)
     warmup(moe_model,tokenizer)
-    return moe_model, tokenizer
+    telemetry=RoutingTelemetry(num_experts=8,top_k=2)
+    telemetry.attach(moe_model)
+    print("Telemetry attached.")
+    return moe_model, tokenizer,telemetry
 
 # generation
 def build_prompt(user_message: str, tokenizer, system_prompt: str = SYSTEM_PROMPT) -> str:
@@ -375,6 +402,7 @@ def generate(
     system_prompt: str  = SYSTEM_PROMPT,
     skip_formatting: bool = False,  # fix(server.py): same as generate_stream() above
     result_info: dict = None,      # fix(server.py): same as generate_stream() above
+    telemetry=None,
 ) -> str:
     """
     Run generation on a single prompt string.
@@ -398,14 +426,30 @@ def generate(
     if temperature > 0:
         gen_kwargs.update(temperature=temperature, top_p=top_p, top_k=top_k)
 
-    outputs = model.generate(**inputs, **gen_kwargs)
+    outputs = None   # fix: so the finally block below can tell whether
+                      # model.generate() actually produced a result or raised
+    try:
+        if telemetry:
+            telemetry.active=True
+            telemetry.reset_session()
 
-    if result_info is not None:
-        gen_ids_for_info = outputs[0][input_len:]
-        last_tok = gen_ids_for_info[-1].item() if len(gen_ids_for_info) > 0 else None
-        result_info["prompt_tokens"] = input_len
-        result_info["completion_tokens"] = len(gen_ids_for_info)
-        result_info["finish_reason"] = "stop" if last_tok == tokenizer.eos_token_id else "length"
+        outputs=model.generate(**inputs,**gen_kwargs)    
+    finally:
+        if telemetry:
+            telemetry.active=False
+
+
+
+        # fix: was unconditional -- if model.generate() raised, `outputs` was
+        # never assigned, and this crashed with a NameError that MASKED the
+        # real underlying exception (OOM, CUDA error, etc). Guarding on
+        # `outputs is not None` lets the real exception propagate cleanly.
+        if result_info is not None and outputs is not None:
+            gen_ids_for_info = outputs[0][input_len:]
+            last_tok = gen_ids_for_info[-1].item() if len(gen_ids_for_info) > 0 else None
+            result_info["prompt_tokens"] = input_len
+            result_info["completion_tokens"] = len(gen_ids_for_info)
+            result_info["finish_reason"] = "stop" if last_tok == tokenizer.eos_token_id else "length"
  
     generated_ids = outputs[0][input_len:]
     return tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
@@ -546,7 +590,7 @@ def main():
 
     args=parser.parse_args()
 
-    model, tokenizer = load_model(args.folder)  
+    model, tokenizer,telemetry = load_model(args.folder)  
     
     run_sanity_check(model,tokenizer)
 
