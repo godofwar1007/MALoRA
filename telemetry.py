@@ -55,6 +55,14 @@ class RoutingTelemetry:
         for layer_idx,counts in self._step_accumulator.items():
             for exp_idx,c in enumerate(counts):
                 total_per_expert[exp_idx]+=c
+
+        # compute per-layer expert assignment for this token
+        layer_experts = []
+        for layer_idx in sorted(self._step_accumulator.keys()):
+            counts = self._step_accumulator[layer_idx]
+            expert_id = max(range(self.num_experts), key=lambda i: counts[i])
+            layer_experts.append(expert_id)
+
         self._step_accumulator.clear()
         self._step_token_count.clear()
 
@@ -89,6 +97,7 @@ class RoutingTelemetry:
             "entropy_pct": round(entropy_pct, 1),
             "tokens_per_sec": toks_per_sec,
             "token_index": self._session_tokens,
+            "layer_experts": layer_experts,
         }
         try:
             self.queue.put_nowait(payload)
