@@ -169,6 +169,7 @@ def gen_kwargs_from_body(body):
         max_tokens = body.get("max_completion_tokens")
     if max_tokens is None:
         max_tokens = DEFAULT_MAX_NEW_TOKENS
+    max_tokens=min(int(max_tokens),4096)    
     return dict(
         max_new_tokens=max_tokens,
         temperature=body.get("temperature", DEFAULT_TEMPERATURE),
