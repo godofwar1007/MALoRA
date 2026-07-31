@@ -1,4 +1,4 @@
-# ── config.py ─────────────────────────────────────────────────────────────────
+# config.py 
 # Dataset configuration for MALoRA training.
 # TrainingConfig (hyperparameters) lives in training_config.py — not here.
 
@@ -30,19 +30,7 @@ class DatasetConfig:
     commitpackft: CommitPackFTConfig = field(default_factory=CommitPackFTConfig)
 
 
-# ── DATASET CONFIG ─────────────────────────────────────────────────────────────
-# nvidia/OpenCodeInstruct — execution-verified coding samples.
-#
-# WHY THIS DATASET:
-# Every sample was actually executed and verified to pass unit tests.
-# Quality filter applied inside the loader:
-#     average_test_score >= 0.8  (passes 80%+ unit tests)
-#     llm_judgement avg  >= 4.5  (LLM scores all 3 criteria >= 4.5/5)
-#
-# HOW TO SWITCH DATASETS:
-# Comment out the opencode_instruct line and uncomment/add others.
-# Weights must sum to 1.0 — the assert below enforces this.
-# Each name must have a corresponding loader in LOADERS in main.py.
+# DATASET CONFIG
 
 TOTAL_SAMPLES  = 50000   # total samples across all datasets combined
 EVAL_FRACTION  = 0.05    # 5% held out for eval → 47500 train / 2500 eval
