@@ -15,26 +15,6 @@ Key changes from the MoE-LoRA codebase this was forked from:
    decomposition is fully contained inside LoraMoeBlock's construction of
    its experts and S_A modules; nothing else needed to know about it.
 
-TRAINABILITY NOTE (read this before touching make_experts_trainable):
-make_experts_trainable() unfreezes parameters by checking for the substring
-'lora_moe_block' in each parameter's fully-qualified name. gate_SA, up_SA,
-and down_SA are registered as nn.Module attributes directly on LoraMoeBlock
-(self.gate_SA = ..., etc.) — NOT on LoraMoeDecoderLayer, and NOT held as
-loose Python references passed around outside the module tree. This means
-their parameters' qualified names look like:
-    base_model.model.layers.N.lora_moe_block.gate_SA.proj.weight
-which contains 'lora_moe_block' and is therefore caught automatically by
-the existing substring check — make_experts_trainable() did NOT need to be
-modified. This was verified deliberately, not assumed: make_experts_trainable()
-itself contains a runtime audit block (see its implementation below) that
-checks gate_SA/up_SA/down_SA's requires_grad status every time it's called
-and warns loudly if any are still frozen — there is no separate standalone
-script; the check is inline and runs as part of normal usage.
-
-Debug print statements that were present in the original causal_model_forward
-(per-step DEBUG prints of vocab_size_model / logits shape / shifted_labels)
-have been removed — they were a known cleanup item, not anything specific
-to MALoRA.
 """
 
 import inspect
@@ -72,7 +52,7 @@ if is_flash_attn_2_available():
 logger = logging.get_logger(__name__)
 
 
-# ── MoE Block (MALoRA) ─────────────────────────────────────────────────────────
+#  MoE Block (MALoRA) 
 
 class LoraMoeBlock(nn.Module):
     """
@@ -108,7 +88,7 @@ class LoraMoeBlock(nn.Module):
             self.hidden_dim, self.num_experts, self.top_k, dropout=config.experts_dropout
         )
 
-        # ── MALoRA: shared S_A subspaces, one per layer, constructed here ──
+        #  MALoRA: shared S_A subspaces, one per layer, constructed here 
         # gate/up project FROM hidden_size; down projects FROM intermediate_size
         # (down's input is the post-activation gate*up product, not hidden_states)
         self.gate_SA = SharedDownProjection(
@@ -157,7 +137,7 @@ class LoraMoeBlock(nn.Module):
         return output, router_logits
 
 
-# ── Attention LoRA Injection (UNCHANGED) ──────────────────────────────────────
+#  Attention LoRA Injection (UNCHANGED) 
 
 class AttentionWithLoRA(nn.Module):
     """
@@ -214,7 +194,7 @@ class AttentionWithLoRA(nn.Module):
         return self.base_attn(*args, **kwargs)
 
 
-# ── Decoder Layer (UNCHANGED) ─────────────────────────────────────────────────
+#  Decoder Layer (UNCHANGED) 
 
 class LoraMoeDecoderLayer(nn.Module):
     """
@@ -282,7 +262,7 @@ class LoraMoeDecoderLayer(nn.Module):
         if "padding_mask" in kwargs:
             warnings.warn("Passing `padding_mask` is deprecated. Use `attention_mask`.", FutureWarning)
 
-        # ── attention block ───────────────────────────────────────────────────
+        #  attention block 
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -307,7 +287,7 @@ class LoraMoeDecoderLayer(nn.Module):
 
         hidden_states = residual + hidden_states
 
-        # ── MoE FFN block ─────────────────────────────────────────────────────
+        #  MoE FFN block
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states, router_logits = self.lora_moe_block(hidden_states, self.mlp)
@@ -327,7 +307,7 @@ class LoraMoeDecoderLayer(nn.Module):
         return outputs
 
 
-# ── Model Forward (UNCHANGED) ─────────────────────────────────────────────────
+# Model Forward (UNCHANGED) 
 
 def model_forward(
     self,
@@ -546,7 +526,7 @@ def causal_model_forward(
         router_logits=outputs.router_logits,
     )
 
-# ── LoraMoeModel Wrapper (UNCHANGED) ──────────────────────────────────────────
+# LoraMoeModel Wrapper (UNCHANGED) 
 
 class LoraMoeModel(torch.nn.Module):
     """
@@ -560,22 +540,7 @@ class LoraMoeModel(torch.nn.Module):
     - All lora_moe_block parameters (MALoRA experts + shared S_A modules + router)
     - All attention LoRA parameters (Q/K/V/O adapters)
 
-    IMPORTANT — verified, not assumed: gate_SA/up_SA/down_SA are nn.Module
-    attributes directly on LoraMoeBlock (self.gate_SA = SharedDownProjection(...)
-    etc. in LoraMoeBlock.__init__), so their parameters' fully-qualified
-    names contain 'lora_moe_block' (e.g.
-    "base_model.model.layers.0.lora_moe_block.gate_SA.proj.weight") and are
-    therefore already caught by make_experts_trainable()'s existing
-    substring check below. No change to that method was needed — but this
-    was deliberately checked, not assumed safe by construction. The
-    runtime audit inside make_experts_trainable() (below) re-verifies this
-    every time it's called, rather than relying on a one-time check here.
     """
-
-    # required — without this, save_pretrained()/trainer.save_model() raises
-    # AttributeError. This was already hit and fixed once in the MoE-LoRA
-    # codebase this was forked from (see handoff doc's "KEY BUGS FIXED" list);
-    # it was dropped during the initial MALoRA port and is restored here.
     _keys_to_ignore_on_save = None
 
     def __init__(
@@ -616,7 +581,7 @@ class LoraMoeModel(torch.nn.Module):
         self.base_model.config = config
         self.base_model.model.config = config
 
-        # untie lm_head from embed_tokens — safetensors refuses shared tensors on save
+        # untie lm_head from embed_tokens safetensors refuses shared tensors on save
         if self.base_model.lm_head.weight.data_ptr() == self.base_model.model.embed_tokens.weight.data_ptr():
             self.base_model.lm_head.weight = nn.Parameter(self.base_model.lm_head.weight.detach().clone())
             self.base_model.config.tie_word_embeddings = False
@@ -668,11 +633,7 @@ class LoraMoeModel(torch.nn.Module):
         print(f"Total parameters:     {total/1e6:.1f}M")
         print(f"Trainable parameters: {trainable/1e6:.1f}M ({100*trainable/total:.2f}%)")
 
-        # ── S_A trainability audit — run every time, not just in debugging ──
-        # cheap (a few hundred parameter names, not a real bottleneck) and
-        # directly guards against the exact silent-failure mode flagged
-        # during review: S_A ending up frozen at random init because its
-        # qualified name didn't land where this method expects to find it.
+
         sa_params = [
             (name, param.requires_grad)
             for name, param in self.named_parameters()
@@ -726,21 +687,6 @@ class LoraMoeModel(torch.nn.Module):
         with no MALoRA/attention-LoRA adapters — i.e. the original frozen
         base model, for a clean export.
 
-        PRE-EXISTING BUG, NOT INTRODUCED BY THE MALoRA PORT: the version
-        this was forked from did `self.base_model.model.layers[layer_id] =
-        layer.mlp`, which replaces the entire decoder layer (attention,
-        layernorms, everything) with just its .mlp submodule — leaving a
-        layer with no attention at all, not a restored original layer.
-        Confirmed identical in the source MoE-LoRA codebase, so this isn't
-        a regression from the port; it was already wrong. Fixed here to
-        actually reconstruct attention + layernorms + the frozen mlp.
-
-        NOTE: this still does NOT reconstruct the exact original Qwen2
-        decoder layer class — it reassembles the pieces LoraMoeDecoderLayer
-        was already holding onto (self.mlp, layernorms, and the unwrapped
-        base attention module) into a minimal stand-in. Good enough for
-        "strip the adapters out," not a guarantee of bit-for-bit identity
-        with the pre-wrap layer object.
         """
         for layer_id in self.layer_ids:
             layer = self.base_model.model.layers[layer_id]
