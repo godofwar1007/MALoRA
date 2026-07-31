@@ -45,7 +45,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP
 from configuration_lora_moe import LoraMoeConfig
 
 
-# ── Shared Down-Projection (S_A) ──────────────────────────────────────────────
+#  Shared Down-Projection (S_A) 
 
 def _svd_init_shared_subspace(
     in_features: int,
@@ -55,37 +55,6 @@ def _svd_init_shared_subspace(
     device=None,
 ) -> torch.Tensor:
     """
-    Derive S_A's initial weights via SVD over throwaway per-expert matrices,
-    rather than independently kaiming-initializing S_A on its own.
-
-    HONEST SCOPE OF THIS FIX (downgraded from an earlier version of this
-    docstring that overclaimed fidelity to the paper): this gives S_A a
-    structured, SVD-derived init instead of a plain random one — but it
-    does NOT control the joint variance of the P_t @ S_A product the way
-    the paper's actual scheme does. The paper ties each expert's P_t to
-    the same SVD (each P_t comes from its own U/S block of the throwaway
-    decomposition), so the product P_t @ S_A is what reproduces single-
-    matrix Kaiming statistics. Here, P_t (in MALoRALinear) is still
-    independently kaiming_uniform_'d with no reference to this SVD — only
-    S_A's own structure is controlled. Since B_bar=0 zeroes the adapter's
-    output at step 0 regardless, this doesn't break forward-pass
-    correctness; it's a partial improvement on gradient-flow fidelity, not
-    a full reproduction of the paper's init scheme. If exact paper fidelity
-    matters for a reported result, this needs the full joint P_t/S_A
-    coupling implemented — flagged here rather than silently left as a gap.
-
-    Procedure: generate N throwaway kaiming-uniform matrices K_1..K_N, one
-    per expert, each shaped [shared_rank, in_features] — matching the
-    paper's K_t in R^(d x n) (d = shared_rank), NOT expert_rank. Getting
-    this dimension right matters: shared_rank and expert_rank are
-    independent config values (e.g. shared_rank=16, expert_rank=32 is a
-    valid asymmetric config) and using the wrong one changes what subspace
-    the SVD extracts. Stack the N throwaway matrices into
-    [N * shared_rank, in_features] and take its SVD. The top `shared_rank`
-    right-singular vectors, scaled by their singular values, define S_A.
-
-    Returns: S_A weight tensor, shape [shared_rank, in_features], float32
-    (caller casts to bf16 after assigning).
     """
     total_rows = num_experts * shared_rank
     assert shared_rank <= total_rows, (
@@ -165,7 +134,7 @@ class SharedDownProjection(nn.Module):
         return self.proj(x)
 
 
-# ── Per-Expert MALoRA Adapter (P_t + B_bar_t) ────────────────────────────────
+#  Per-Expert MALoRA Adapter (P_t + B_bar_t) 
 
 class MALoRALinear(nn.Module):
     """
@@ -247,7 +216,7 @@ class MALoRALinear(nn.Module):
         return self.B_bar(self.P(s)) * self.scale
 
 
-# ── MLP Expert (MALoRA) ───────────────────────────────────────────────────────
+# MLP Expert (MALoRA) 
 
 class LoraExpert(nn.Module):
     """
@@ -257,21 +226,6 @@ class LoraExpert(nn.Module):
     Unlike the old LoraExpert, this does NOT own its down-projection — gate
     and up route through the layer's shared S_A subspaces, down through its
     own down_SA.
-
-    PERFORMANCE NOTE — why gate/up and down are handled differently here:
-    With top-k routing, a token can be assigned to multiple experts, so
-    gate_SA(hidden_states) and up_SA(hidden_states) are IDENTICAL regardless
-    of which expert ends up using them — recomputing them once per assigned
-    expert (as a naive forward(hidden_states, gate_SA, up_SA, ...) would)
-    wastes compute proportional to top_k. DispatchMoERouter therefore
-    computes s_gate = gate_SA(hidden_states) and s_up = up_SA(hidden_states)
-    ONCE globally before dispatching to any expert, then gathers the
-    per-expert token subset of that already-projected tensor and passes it
-    in here via MALoRALinear.forward_from_shared(). down_SA can NOT be
-    hoisted the same way — its input `act` depends on THIS expert's own
-    gate/up LoRA deltas (act = activation(gate) * up, and gate/up differ
-    per expert via their private P/B_bar), so down must stay genuinely
-    per-expert and is computed inside forward() as before.
 
     Forward (shape of the math):
         gate = mlp.gate_proj(x) + gate_lora.forward_from_shared(s_gate_for_this_expert)
@@ -337,7 +291,7 @@ class LoraExpert(nn.Module):
         return down
 
 
-# ── Attention LoRA (UNCHANGED — not part of the MALoRA decomposition) ────────
+# Attention LoRA (UNCHANGED — not part of the MALoRA decomposition) 
 
 class AttentionLoRA(nn.Module):
     """
@@ -418,7 +372,7 @@ class _StandardLoraLinear(nn.Module):
         return self.B(self.A(self.dropout(x))) * self.scale
 
 
-# ── Real Sparse Token-Dispatch MoE Router ─────────────────────────────────────
+# Real Sparse Token-Dispatch MoE Router 
 
 class DispatchMoERouter(nn.Module):
     """
@@ -508,7 +462,7 @@ class DispatchMoERouter(nn.Module):
 
         num_tokens = hidden_states.shape[0]
 
-        # ── routing decision (identical math to before) ─────────────────────
+        # routing decision (identical math to before) 
         logits = self.gate(hidden_states)
 
         if self.training:
@@ -520,17 +474,12 @@ class DispatchMoERouter(nn.Module):
         top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
         top_k_weights = top_k_weights.to(hidden_states.dtype)
 
-        # ── hoisted shared projection (THE FIX for redundant compute) ───────
-        # computed once for ALL tokens, regardless of how many experts each
-        # token is ultimately routed to. dropout sampled once per token here,
-        # rather than once per (token, assigned-expert) pair as a naive
-        # per-expert recompute would do — also makes dropout behavior
-        # consistent across a token's top_k assigned experts in one pass.
+
         dropped = self.shared_proj_dropout(hidden_states)
         s_gate_all = gate_SA(dropped)   # [num_tokens, shared_rank]
         s_up_all   = up_SA(dropped)     # [num_tokens, shared_rank]
 
-        # ── real sparse dispatch (unchanged structure) ───────────────────────
+        # real sparse dispatch (unchanged structure) 
         output = torch.zeros_like(hidden_states)
 
         flat_expert_ids = top_k_indices.reshape(-1)
