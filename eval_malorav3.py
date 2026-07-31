@@ -18,16 +18,16 @@ Forked from eval_malorav2.py. Changes from that file:
 
 Usage:
     # eval a MALoRA aton run
-    python eval_malora_v3.py --folder malora_50k_1ep_aton --attn-on --dataset humaneval
+    python eval_malorav3.py --folder malora_50k_1ep_aton --attn-on --dataset humaneval
 
     # eval a specific checkpoint
-    python eval_malora_v3.py --folder malora_50k_1ep_aton/checkpoint-1000 --attn-on --dataset both
+    python eval_malorav3.py --folder malora_50k_1ep_aton/checkpoint-1000 --attn-on --dataset both
 
     # sanity check only (3 inference prompts, no benchmark)
-    python eval_malora_v3.py --folder malora_50k_1ep_aton --attn-on --sanity-only
+    python eval_malorav3.py --folder malora_50k_1ep_aton --attn-on --sanity-only
 
     # eval an atoff run (no attention LoRA)
-    python eval_malora_v3.py --folder malora_50k_1ep_atoff --dataset humaneval
+    python eval_malorav3.py --folder malora_50k_1ep_atoff --dataset humaneval
 """
 
 import argparse
@@ -39,7 +39,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from safetensors.torch import load_file
 from huggingface_hub import snapshot_download
 
-# ── HF config ─────────────────────────────────────────────────────────────────
+#  HF config
 HF_TOKEN    = ""   # update if expired
 HF_REPO_ID  = "godofwar1007/moelora"
 BASE_MODEL  = "Qwen/Qwen2.5-Coder-3B-Instruct"
@@ -47,7 +47,7 @@ BASE_MODEL  = "Qwen/Qwen2.5-Coder-3B-Instruct"
 MAX_NEW_TOKENS = 512
 OUTPUT_DIR     = "eval_outputs"
 
-# ── MALoRA hyperparameters (must match what was used during training) ──────────
+# MALoRA hyperparameters (must match what was used during training)
 # If you trained with different values, change these to match training_config.py
 SHARED_RANK      = 16     # d — S_A's rank
 EXPERT_RANK      = 16     # r_bar — P_t / B_bar_t rank
@@ -57,7 +57,7 @@ ATTENTION_RANK   = 32
 NUM_EXPERTS      = 8
 NUM_EXPERTS_PER_TOK = 2
 
-# ── make sure local architecture files are importable ─────────────────────────
+#  make sure local architecture files are importable 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -65,7 +65,7 @@ from configuration_lora_moe import LoraMoeConfig
 from modelling import LoraMoeModel
 
 
-# ── model loading ─────────────────────────────────────────────────────────────
+# model loading
 
 def load_model(hf_folder: str, attn_on: bool):
     """
@@ -81,7 +81,7 @@ def load_model(hf_folder: str, attn_on: bool):
     print(f"shared_rank={SHARED_RANK}  expert_rank={EXPERT_RANK}")
     print(f"{'='*60}\n")
 
-    # ── step 1: download subfolder from HF ───────────────────────────────────
+    #  step 1: download subfolder from HF 
     print("Downloading checkpoint from HF Hub...")
     local_dir = snapshot_download(
         repo_id=HF_REPO_ID,
@@ -106,14 +106,14 @@ def load_model(hf_folder: str, attn_on: bool):
     print(f"Checkpoint found at: {ckpt_path}")
     print(f"Size: {os.path.getsize(ckpt_path)/1e9:.2f} GB\n")
 
-    # ── step 2: tokenizer ─────────────────────────────────────────────────────
+    # step 2: tokenizer 
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
 
-    # ── step 3: base model ────────────────────────────────────────────────────
+    # step 3: base model
     print("Loading base model...")
     base_model = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL,
@@ -124,7 +124,7 @@ def load_model(hf_folder: str, attn_on: bool):
     )
     base_model.config.use_cache = True
 
-    # ── step 4: wrap with MALoRA LoraMoeModel ────────────────────────────────
+    #  step 4: wrap with MALoRA LoraMoeModel 
     print("Wrapping with MALoRA LoraMoeModel...")
     moe_config = LoraMoeConfig.from_pretrained(BASE_MODEL)
 
@@ -144,7 +144,7 @@ def load_model(hf_folder: str, attn_on: bool):
 
     moe_model = LoraMoeModel(base_model, moe_config)
 
-    # ── step 5: load saved weights ────────────────────────────────────────────
+    # step 5: load saved weights
     print("Loading saved weights...")
     saved_sd = load_file(ckpt_path, device="cpu")
     model_sd = moe_model.state_dict()
@@ -181,7 +181,7 @@ def load_model(hf_folder: str, attn_on: bool):
     missing = moe_model.load_state_dict(matched, strict=False)
     print(f"  Missing from checkpoint (frozen base weights expected): {len(missing.missing_keys)}")
 
-    # ── step 6: verify MALoRA weights loaded ──────────────────────────────────
+    # step 6: verify MALoRA weights loaded 
     # MALoRA key patterns differ from MoE-LoRA:
     #   MoE-LoRA:  gate_lora.A / gate_lora.B  (per expert, independent)
     #   MALoRA:    gate_SA.proj               (shared S_A matrix)
@@ -226,7 +226,7 @@ def load_model(hf_folder: str, attn_on: bool):
     return moe_model, tokenizer
 
 
-# ── sanity check inference ────────────────────────────────────────────────────
+# sanity check inference
 
 def sanity_check(model, tokenizer):
     print("Running sanity check inference...")
@@ -261,7 +261,7 @@ def sanity_check(model, tokenizer):
         print("-" * 40)
 
 
-# ── generation ────────────────────────────────────────────────────────────────
+# generation
 
 def strip_markdown(code: str) -> str:
     lines = code.strip().splitlines()
@@ -289,7 +289,7 @@ def generate(model, tokenizer, prompt: str) -> str:
     return tokenizer.decode(out[0][input_len:], skip_special_tokens=True)
 
 
-# ── HumanEval+ ───────────────────────────────────────────────────────────────
+# HumanEval+
 
 def run_humaneval(model, tokenizer, tag: str):
     from evalplus.data import get_human_eval_plus
@@ -323,7 +323,7 @@ def run_humaneval(model, tokenizer, tag: str):
     return out_path
 
 
-# ── MBPP+ ─────────────────────────────────────────────────────────────────────
+# MBPP+ 
 
 def run_mbpp(model, tokenizer, tag: str):
     from evalplus.data import get_mbpp_plus
@@ -355,14 +355,14 @@ def run_mbpp(model, tokenizer, tag: str):
     return out_path
 
 
-# ── scoring ───────────────────────────────────────────────────────────────────
+# scoring 
 
 def score(dataset: str, completions_path: str):
     print(f"\nScoring {dataset}...")
     os.system(f"python -m evalplus.evaluate --dataset {dataset} --samples {completions_path}")
 
 
-# ── main ──────────────────────────────────────────────────────────────────────
+#  main
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
