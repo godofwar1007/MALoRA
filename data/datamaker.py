@@ -1,5 +1,3 @@
-# ── main.py ───────────────────────────────────────────────────────────────────
-
 import os
 import random
 
@@ -8,10 +6,7 @@ from transformers import AutoTokenizer
 
 from training_config import TrainingConfig          # TrainingConfig lives here, NOT in config.py
 from config import DATASET_CONFIGS, TOTAL_SAMPLES, EVAL_FRACTION
-
-# ── active loaders ─────────────────────────────────────────────────────────────
-# Only import loaders that are actually used in DATASET_CONFIGS.
-# Add imports here when enabling new datasets in config.py.
+.
 from loaders.opencode_instruct import OpenCodeInstructLoader
 
 # ── commented-out loaders (available if you switch datasets in config.py) ─────
@@ -34,13 +29,13 @@ if hf_token:
 else:
     print("WARNING: HF_TOKEN not set — gated datasets will fail")
 
-# ── tokenizer ──────────────────────────────────────────────────────────────────
+# tokenizer 
 conf      = TrainingConfig()
 tokenizer = AutoTokenizer.from_pretrained(conf.MODEL_ID, trust_remote_code=True)
 if tokenizer.pad_token_id is None:
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
-# ── loaders ────────────────────────────────────────────────────────────────────
+# loaders 
 # Add an entry here for every dataset name used in DATASET_CONFIGS.
 # If a name appears in DATASET_CONFIGS but not here, make_dataset() raises
 # a clear KeyError immediately rather than silently skipping it.
@@ -61,7 +56,7 @@ LOADERS = {
 }
 
 
-# ── main ───────────────────────────────────────────────────────────────────────
+# main 
 def make_dataset():
     all_train = []
     all_eval  = []
