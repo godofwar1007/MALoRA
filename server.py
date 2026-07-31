@@ -62,59 +62,93 @@ async def health():
     return {"status": "ok"}
 
 # some tool call parsing 
-# confirmed tag format by actually rendering the tokenizer's chat template
-# with tools= a few turns back: <tool_call>\n{"name": ..., "arguments": ...}\n</tool_call>
 TOOL_CALL_OPEN  = "<tool_call>"
 TOOL_CALL_CLOSE = "</tool_call>"
 
+def try_parse_tool_call_dict(raw: str) -> dict | None:
+    raw = raw.strip()
+    if raw.startswith("```json"):
+        raw = raw[7:].rstrip("`").strip()
+    elif raw.startswith("```"):
+        raw = raw[3:].rstrip("`").strip()
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and "name" in data and ("arguments" in data or "parameters" in data):
+            args = data.get("arguments") if "arguments" in data else data.get("parameters")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    pass
+            if not isinstance(args, dict):
+                args = {}
+            return {"name": str(data["name"]), "arguments": args}
+    except Exception:
+        pass
+    return None
+
 def parse_tool_calls(token_iter):
-    """
-    Wraps a stream of text pieces (or a single full string, wrapped in an
-    iterator), watching for <tool_call>...</tool_call> blocks -- same idea as
-    the harness's own <think>-block stripping, applied to a different tag.
-    Yields ("text", str) for plain content and ("tool_call", dict) for a
-    fully parsed tool call, in the order they appeared.
-    """
     buffer = ""
-    in_tool_call = False
     for token in token_iter:
         buffer += token
-        while True:
-            if not in_tool_call:
-                idx = buffer.find(TOOL_CALL_OPEN)
-                if idx == -1:
-                    # hold back a tail as long as the open tag, in case it's
-                    # split across two token pieces from the streamer
-                    safe_len = max(0, len(buffer) - len(TOOL_CALL_OPEN))
-                    if safe_len:
-                        yield ("text", buffer[:safe_len])
-                        buffer = buffer[safe_len:]
-                    break
-                if idx > 0:
-                    yield ("text", buffer[:idx])
-                buffer = buffer[idx + len(TOOL_CALL_OPEN):]
-                in_tool_call = True
-            else:
-                idx = buffer.find(TOOL_CALL_CLOSE)
-                if idx == -1:
-                    break  # wait for more tokens before deciding anything
-                raw = buffer[:idx].strip()
-                buffer = buffer[idx + len(TOOL_CALL_CLOSE):]
-                in_tool_call = False
-                try:
-                    yield ("tool_call", json.loads(raw))
-                except json.JSONDecodeError:
-                    # malformed -- surface as text rather than silently
-                    # dropping whatever the model actually said
-                    yield ("text", f"{TOOL_CALL_OPEN}{raw}{TOOL_CALL_CLOSE}")
+        stripped = buffer.lstrip()
+        # Check for potential tool call markers
+        if stripped.startswith(("```json", "```", "{")):
+            # Try to parse the entire buffer as a tool call
+            if stripped.startswith("```json"):
+                end_idx = stripped.find("```", 7)
+                if end_idx != -1:
+                    raw = stripped[7:end_idx].strip()
+                    parsed = try_parse_tool_call_dict(raw)
+                    if parsed:
+                        yield ("tool_call", parsed)
+                        buffer = stripped[end_idx+3:].lstrip()
+                        continue
+                    # not a valid tool call – fall through to text
+            elif stripped.startswith("```"):
+                end_idx = stripped.find("```", 3)
+                if end_idx != -1:
+                    raw = stripped[3:end_idx].strip()
+                    parsed = try_parse_tool_call_dict(raw)
+                    if parsed:
+                        yield ("tool_call", parsed)
+                        buffer = stripped[end_idx+3:].lstrip()
+                        continue
+            elif stripped.startswith("{"):
+                # Try to parse the buffer as JSON (tool call)
+                parsed = try_parse_tool_call_dict(buffer)
+                if parsed:
+                    yield ("tool_call", parsed)
+                    buffer = ""
+                    continue
+                if "\n" in stripped and not stripped.lstrip().startswith("{"):
+                    yield ("text", buffer)
+                    buffer = ""
+                    continue
+                # Otherwise keep accumulating (buffer could be a partial JSON)
+                continue
+        if buffer:
+            yield ("text", buffer)
+            buffer = ""
+
+    # Final leftover
     if buffer:
-        yield ("text", buffer)
+        parsed = try_parse_tool_call_dict(buffer)
+        if parsed:
+            yield ("tool_call", parsed)
+        else:
+            yield ("text", buffer)
 
 def extract_tool_calls(full_text: str):
     """Same parser as above, applied to one already-complete string (non-streaming path)."""
     text_parts, tool_calls = [], []
     for kind, value in parse_tool_calls(iter([full_text])):
         (text_parts if kind == "text" else tool_calls).append(value)
+    combined_text = "".join(text_parts).strip()
+    if not tool_calls and combined_text:
+        parsed = try_parse_tool_call_dict(combined_text)
+        if parsed:
+            return "", [parsed]
     return "".join(text_parts), tool_calls
 
 # messages/tools prep for the chat template 
@@ -141,7 +175,7 @@ def prepare_messages(messages):
                     try:
                         fn["arguments"] = json.loads(args)
                     except json.JSONDecodeError:
-                        pass  # leave as-is rather than crash the request
+                        pass  
                 tc["function"] = fn
                 new_calls.append(tc)
             msg["tool_calls"] = new_calls
@@ -161,9 +195,6 @@ def build_prompt_and_tokens(body):
     return formatted, prompt_tokens
 
 def gen_kwargs_from_body(body):
-    # fix: `a or b or c` treats an explicit 0 the same as "not provided" --
-    # use is-not-None checks so max_tokens=0 (unusual, but valid per the
-    # OpenAI spec) isn't silently overridden with our default.
     max_tokens = body.get("max_tokens")
     if max_tokens is None:
         max_tokens = body.get("max_completion_tokens")
@@ -290,7 +321,7 @@ def complete(body, request_id, model_name,telemetry=None):
     formatted, prompt_tokens = build_prompt_and_tokens(body)
     gen_kwargs = gen_kwargs_from_body(body)
 
-    result_info: dict = {}   # fix: same reasoning as the streaming path above
+    result_info: dict = {}   
     with _generation_lock:
         raw_text = generate(
             _model, _tokenizer, formatted, skip_formatting=True,
@@ -372,7 +403,7 @@ async def chat_completions(request: Request):
         )
 
 # telemetry endpoint 
-@app.get("/telemetry/stream")
+@app.get("/v1/telemetry/stream")
 async def telemetry_stream():
     """Server-Sent Events endpoint for live routing telemetry."""
     def event_generator():
