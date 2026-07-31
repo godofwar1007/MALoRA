@@ -28,7 +28,7 @@ from modelling import LoraMoeModel
 from training_config import TrainingConfig
 from main import make_dataset
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# Config 
 conf = TrainingConfig()
 
 MODEL_ID             = conf.MODEL_ID
@@ -62,7 +62,7 @@ RESUME_FROM          = conf.RESUME_FROM
 ATTENTION_LORA_ENABLED = True  # toggle here for aton/atoff runs
 
 
-# ── QLoRA config ──────────────────────────────────────────────────────────────
+# QLoRA config
 def get_qlora_bnb_config() -> BitsAndBytesConfig:
     return BitsAndBytesConfig(
         load_in_4bit=True,
@@ -72,7 +72,7 @@ def get_qlora_bnb_config() -> BitsAndBytesConfig:
     )
 
 
-# ── Auto-save on crash/interrupt ──────────────────────────────────────────────
+# Auto-save on crash/interrupt 
 _trainer_ref = None
 
 def _emergency_save(signum, frame):
@@ -91,7 +91,7 @@ signal.signal(signal.SIGTERM, _emergency_save)
 signal.signal(signal.SIGINT,  _emergency_save)
 
 
-# ── Custom MoE Trainer ────────────────────────────────────────────────────────
+# Custom MoE Trainer 
 class MoETrainer(Trainer):
     """
     Tracks aux loss, routing entropy, and per-expert usage telemetry.
@@ -107,7 +107,7 @@ class MoETrainer(Trainer):
         self._current_train_aux_loss: float = 0.0
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        # ── clamp labels to model's actual vocab size ──────────────────────
+        #  clamp labels to model's actual vocab size 
         labels = inputs.get("labels")
         if labels is not None:
             vocab_size = model.base_model.lm_head.weight.shape[0]
@@ -124,7 +124,7 @@ class MoETrainer(Trainer):
         outputs = model(**inputs)
         loss = outputs.loss
 
-        # ── aux loss tracking ─────────────────────────────────────────────
+        # aux loss tracking 
         if hasattr(outputs, "aux_loss") and outputs.aux_loss is not None:
             aux_val = outputs.aux_loss.detach().item()
             if model.training:
@@ -132,7 +132,7 @@ class MoETrainer(Trainer):
             else:
                 self._eval_aux_losses.append(aux_val)
 
-        # ── expert routing telemetry ──────────────────────────────────────
+        # expert routing telemetry 
         if hasattr(outputs, "router_logits") and outputs.router_logits is not None and model.training:
             all_entropies = []
             all_usage     = []
@@ -191,7 +191,7 @@ class MoETrainer(Trainer):
         return dataset
 
 
-# ── WandB Callback ────────────────────────────────────────────────────────────
+#  WandB Callback 
 class WandbConfigCallback(TrainerCallback):
     def on_train_begin(self, args, state, control, **kwargs):
         try:
@@ -214,7 +214,7 @@ class WandbConfigCallback(TrainerCallback):
             pass
 
 
-# ── Checkpoint resume helper ──────────────────────────────────────────────────
+#  Checkpoint resume helper
 def resolve_checkpoint(resume_from: str | None, accelerator: Accelerator) -> str | None:
     if not resume_from:
         return None
@@ -238,7 +238,7 @@ def resolve_checkpoint(resume_from: str | None, accelerator: Accelerator) -> str
     return resume_from
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# Main 
 def main():
     global _trainer_ref
 
@@ -254,7 +254,7 @@ def main():
 
     set_seed(SEED)
 
-    # ── Tokenizer ─────────────────────────────────────────────────────────────
+    #  Tokenizer 
     if accelerator.is_main_process:
         print("Loading tokenizer...")
 
@@ -264,7 +264,7 @@ def main():
     tokenizer.padding_side    = "right"
     tokenizer.truncation_side = "left"
 
-    # ── Datasets ──────────────────────────────────────────────────────────────
+    # Datasets 
     with accelerator.main_process_first():
         if os.path.exists("data/train") and os.path.exists("data/eval"):
             if accelerator.is_main_process:
@@ -289,7 +289,7 @@ def main():
         label_pad_token_id=-100,
     )
 
-    # ── Base model ────────────────────────────────────────────────────────────
+    # Base model
     if accelerator.is_main_process:
         print("Loading base model...")
         print(f"  QUANTIZE = {QUANTIZE}  ({'4-bit QLoRA' if QUANTIZE else 'full bf16 (no quantization)'})")
@@ -311,7 +311,7 @@ def main():
     base_model.enable_input_require_grads()
     base_model.config.use_cache = False
 
-    # ── MALoRA wrap ───────────────────────────────────────────────────────────
+    # MALoRA wrap 
     if accelerator.is_main_process:
         print("Wrapping with MALoRA...")
 
@@ -354,7 +354,7 @@ def main():
             total_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
             print(f"VRAM after model wrap: {allocated:.2f}GB allocated / {reserved:.2f}GB reserved / {total_mem:.2f}GB total")
 
-    # ── Training args ─────────────────────────────────────────────────────────
+    # Training args 
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
         num_train_epochs=NUM_EPOCHS,
@@ -389,7 +389,7 @@ def main():
         greater_is_better=False,
     )
 
-    # ── Trainer ───────────────────────────────────────────────────────────────
+    # Trainer
     trainer = MoETrainer(
         tokenizer=tokenizer,
         model=moe_model,
@@ -403,7 +403,7 @@ def main():
 
     _trainer_ref = trainer
 
-    # ── Train ─────────────────────────────────────────────────────────────────
+    # Train 
     if accelerator.is_main_process:
         print("\nStarting training...")
         print(f"  Steps per epoch: {len(train_dataset) // (TRAIN_BATCH * GRAD_ACCUM)}")
@@ -411,7 +411,7 @@ def main():
 
     trainer.train(resume_from_checkpoint=resume_from)
 
-    # ── Save ──────────────────────────────────────────────────────────────────
+    # Save
     if accelerator.is_main_process:
         trainer.save_model(OUTPUT_DIR)
         tokenizer.save_pretrained(OUTPUT_DIR)
