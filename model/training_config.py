@@ -5,7 +5,7 @@ from typing import Optional
 @dataclass
 class TrainingConfig:
 
-    # ── MALoRA architecture parameters ────────────────────────────────────────
+    #  MALoRA architecture parameters 
     # SHARED_RANK -> d, rank of S_A (shared subspace, one per gate/up/down per
     #                layer, reused by all experts)
     # EXPERT_RANK -> r_bar, expanded per-expert rank used by both P_t (private
@@ -24,13 +24,7 @@ class TrainingConfig:
     NUM_EXPERTS: int         = 8          # total experts
     ROUTER_AUX_COEF: float   = 0.001     # was 0.01 — too high causes over-regularization
 
-    # ── Training parameters ───────────────────────────────────────────────────
-    # These match the MoE-LoRA run that first beat baseline on all metrics.
-    # The two critical fixes vs all prior runs:
-    #   LR: 2e-4 → 1e-5  (was 40x too high — thrashed alignment faster than
-    #                      the model could absorb new signal)
-    #   CONTEXT_LENGTH: 1024 → 2048  (matches paper setup, captures full
-    #                                  solutions without mid-truncation)
+    #  Training parameters 
     SEED: int            = 42
     NUM_EPOCHS: int      = 1
     TRAIN_BATCH: int     = 16
@@ -42,13 +36,13 @@ class TrainingConfig:
     MAX_STEPS: int       = -1             # -1 for full training
     LOGGING_STEPS: int   = 25
 
-    # ── Model parameters ──────────────────────────────────────────────────────
+    #  Model parameters 
     USE_8BIT_ADAM: bool  = True
     MIXED_PRECISION: str = "bf16"
-    QUANTIZE: bool       = False          # full bf16 — H100 has headroom
+    QUANTIZE: bool       = False          
     MODEL_ID: str        = "Qwen/Qwen2.5-Coder-3B-Instruct"
 
-    # ── Checkpoint / logging ──────────────────────────────────────────────────
+    #  Checkpoint / logging 
     RESUME_FROM: str | None   = None
     OUTPUT_DIR: str           = "./outputs/malora"
     NUM_CHECKPOINT_LIMIT: int = 2
