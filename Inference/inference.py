@@ -25,7 +25,7 @@ torch.backends.cudnn.allow_tf32 = True
 
 
 # config 
-BASE_MODEL  = "Qwen/Qwen2.5-Coder-3B-Instruct"
+BASE_MODEL  = "Qwen/Qwen2.5-3B-Instruct"
 HF_REPO_ID  = "godofwar1007/moelora"
 HF_TOKEN    = os.environ.get("HF_TOKEN", "")
 
