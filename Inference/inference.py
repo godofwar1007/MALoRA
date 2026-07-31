@@ -14,14 +14,14 @@ from telemetry import RoutingTelemetry
 
 from transformers import TextIteratorStreamer
 import threading 
-import queue   # fix: needed to catch the streamer timeout below
+import queue   
 
-load_dotenv()   # fix: this was imported but never called, so HF_TOKEN from .env was never actually loaded into os.environ
+load_dotenv()   
 
-torch.backends.cuda.matmul.allow_tf32 = True   # fix: free throughput on Ampere+ (A10G/L40S/H100), no downside for bf16 weights
+torch.backends.cuda.matmul.allow_tf32 = True  
 torch.backends.cudnn.allow_tf32 = True
 
-# some things related to telemetry 
+
 
 
 # config 
@@ -35,7 +35,7 @@ DEFAULT_TEMPERATURE    = 0.2      # low temp for coding = more deterministic
 DEFAULT_TOP_P          = 0.95
 DEFAULT_TOP_K          = 50
 DEFAULT_REPETITION_PENALTY = 1.05
-DEFAULT_STREAM_TIMEOUT = 120   # fix: seconds of silence on the streamer queue before we give up
+DEFAULT_STREAM_TIMEOUT = 120   
 
 SYSTEM_PROMPT = (
     "You are an expert Python programmer. "
@@ -90,9 +90,7 @@ def apply_compile(moe_model):
                 adapter.B_bar=torch.compile(adapter.B_bar,dynamic=True,fullgraph=False)
                 compiled+=2
 
-        # dispatch loop in block.router.forward() is not compiled
-        # mask.any() is data-dependent control flow that causes unavoidable
-        # graph breaks. The linear layers it calls are compiled above.
+
 
     print(f"  Compiled {compiled} linear layers across {len(moe_model.base_model.model.layers)} decoder layers")
     return moe_model
@@ -114,7 +112,7 @@ def warmup(moe_model,tokenizer):
     ).to(device)
 
     for i in range(3):
-        with torch.inference_mode():   # fix: was no_grad, missed in the earlier inference_mode sweep
+        with torch.inference_mode():   
             moe_model.generate(
                 **dummy_input,
                 max_new_tokens=8,
@@ -132,7 +130,7 @@ def warmup(moe_model,tokenizer):
         "# matches a given value, handling missing keys gracefully.\ndef filter_by_key(",
         return_tensors="pt"
     ).to(device)
-    with torch.inference_mode():   # fix: same miss as the short warmup pass above
+    with torch.inference_mode():   
         moe_model.generate(
             **long_dummy_input,
             max_new_tokens=8,
@@ -155,15 +153,15 @@ def generate_stream(
     top_p: float        = DEFAULT_TOP_P,
     top_k: int          = DEFAULT_TOP_K,
     repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
-    system_prompt: str  = SYSTEM_PROMPT,   # fix: caller (server.py/harness) can now override this
-    skip_formatting: bool = False,  # fix(server.py): when True, `prompt` is already a fully
+    system_prompt: str  = SYSTEM_PROMPT,  
+    skip_formatting: bool = False,  
                                     # rendered chat-template string (built by server.py via
                                     # apply_chat_template, with the full multi-turn conversation +
                                     # tools) -- skip build_prompt entirely instead of re-wrapping
                                     # it as a single user turn under our own SYSTEM_PROMPT.
-    result_info: dict = None,      # fix(server.py): server.py needs prompt/completion token
+    result_info: dict = None,      
                                     # counts and finish_reason (stop vs length). model.generate()
-                                    # still returns the full sequence even with a streamer
+                                    # returns the full sequence even with a streamer
                                     # attached -- pass a dict in and it gets filled before return.
     telemetry=None,                                
 ):
@@ -179,7 +177,7 @@ def generate_stream(
 
     streamer=TextIteratorStreamer(
         tokenizer,
-        skip_prompt=True,    # so it doenst yeild the input prompt back
+        skip_prompt=True,    # doenst yeild the input prompt back
         skip_special_tokens=True,
         timeout=DEFAULT_STREAM_TIMEOUT,
     )
@@ -203,7 +201,7 @@ def generate_stream(
         try:
             with torch.inference_mode():
                 out = model.generate(**generation_kwargs)
-                seq_box["sequences"] = out   # fix(server.py): generate() still returns this even with a streamer attached
+                seq_box["sequences"] = out   
         except Exception as e:
             exception_box["error"] = e
 
@@ -221,7 +219,6 @@ def generate_stream(
                 yield token
         except queue.Empty:
             # Generation stalled - raise a clear error 
-            # fix: was a bare thread.join() with no timeout -- we've already
             # waited the full DEFAULT_STREAM_TIMEOUT for a token at this
             # point, so if the thread is genuinely stuck (not crashed, just
             # hung) this would block forever again, defeating the whole
@@ -242,7 +239,6 @@ def generate_stream(
             telemetry.active=False       
 
   
-        # fix(server.py): fill in result_info for the caller now that generation is done
         if result_info is not None and "sequences" in seq_box:
             gen_ids = seq_box["sequences"][0][input_len:]
             last_tok = gen_ids[-1].item() if len(gen_ids) > 0 else None
@@ -310,7 +306,7 @@ def load_model(hf_folder: str, attn_on: bool = True):
     moe_config.num_local_experts    = 8
     moe_config.output_router_logits = False
     moe_config.router_aux_loss_coef = 0.001
-    moe_config.use_attention_lora   = attn_on   # fix(server.py): was hardcoded True -- now the
+    moe_config.use_attention_lora   = attn_on   
                                                  # caller decides (server.py reads MALORA_ATTN_ON)
 
     moe_model=LoraMoeModel(base_model,moe_config)
@@ -400,8 +396,8 @@ def generate(
     top_k: int          = DEFAULT_TOP_K,
     repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
     system_prompt: str  = SYSTEM_PROMPT,
-    skip_formatting: bool = False,  # fix(server.py): same as generate_stream() above
-    result_info: dict = None,      # fix(server.py): same as generate_stream() above
+    skip_formatting: bool = False,  
+    result_info: dict = None,      
     telemetry=None,
 ) -> str:
     """
@@ -426,7 +422,7 @@ def generate(
     if temperature > 0:
         gen_kwargs.update(temperature=temperature, top_p=top_p, top_k=top_k)
 
-    outputs = None   # fix: so the finally block below can tell whether
+    outputs = None   
                       # model.generate() actually produced a result or raised
     try:
         if telemetry:
@@ -439,11 +435,6 @@ def generate(
             telemetry.active=False
 
 
-
-        # fix: was unconditional -- if model.generate() raised, `outputs` was
-        # never assigned, and this crashed with a NameError that MASKED the
-        # real underlying exception (OOM, CUDA error, etc). Guarding on
-        # `outputs is not None` lets the real exception propagate cleanly.
         if result_info is not None and outputs is not None:
             gen_ids_for_info = outputs[0][input_len:]
             last_tok = gen_ids_for_info[-1].item() if len(gen_ids_for_info) > 0 else None
