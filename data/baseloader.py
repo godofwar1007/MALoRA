@@ -49,13 +49,12 @@ class BaseDatasetLoader:
 
         collected = {"input_ids": [], "attention_mask": [], "labels": []}
 
-        # ── per-reason skip counters ──────────────────────────────────
+        #  per-reason skip counters 
         raw_streamed      = 0
         format_rejected   = 0
         context_overflow  = 0
         all_labels_masked = 0
-        # ─────────────────────────────────────────────────────────────
-
+        
         for example in ds:
             if len(collected["input_ids"]) >= n_samples:
                 break
@@ -68,10 +67,9 @@ class BaseDatasetLoader:
                 format_rejected += 1
                 continue
 
-            # ── multi-sample detection ────────────────────────────────
+            # multi-sample detection 
             # if first element is itself a list, treat as multiple samples
             samples = raw if isinstance(raw[0], list) else [raw]
-            # ─────────────────────────────────────────────────────────
 
             for messages in samples:
                 if len(collected["input_ids"]) >= n_samples:
@@ -94,7 +92,7 @@ class BaseDatasetLoader:
                 collected["attention_mask"].append(tokenized["attention_mask"])
                 collected["labels"].append(tokenized["labels"])
 
-        # ── diagnostics ───────────────────────────────────────────────
+        # diagnostics 
         samples_collected = len(collected["input_ids"])
         total_skipped     = format_rejected + context_overflow + all_labels_masked
         overflow_rate     = (context_overflow / raw_streamed * 100) if raw_streamed else 0.0
@@ -113,7 +111,7 @@ class BaseDatasetLoader:
                 f"\n  [{self.__class__.__name__}] WARNING: "
                 f"exhausted before {n_samples} — got {samples_collected}"
             )
-        # ─────────────────────────────────────────────────────────────
+        
 
         return collected
 
