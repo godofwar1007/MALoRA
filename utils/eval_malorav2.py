@@ -2,16 +2,16 @@
 
 Usage:
     # eval the 20k attn-off final model on both benchmarks
-    python eval_malora.py --folder 20k_1ep_atoff --dataset both
+    python eval_malorav2.py --folder 20k_1ep_atoff --dataset both
 
     # eval a specific checkpoint
-    python eval_malora.py --folder 20k_1ep_atoff/checkpoint-777 --dataset humaneval
+    python eval_malorav2.py --folder 20k_1ep_atoff/checkpoint-777 --dataset humaneval
 
     # eval the 10k run
-    python eval_malora.py --folder 10k_1ep_atoff --dataset both
+    python eval_malorav2.py --folder 10k_1ep_atoff --dataset both
 
     # just run inference to sanity check (no benchmarks)
-    python eval_malora.py --folder 20k_1ep_atoff --sanity-only
+    python eval_malorav2.py --folder 20k_1ep_atoff --sanity-only
 """
 
 import argparse
